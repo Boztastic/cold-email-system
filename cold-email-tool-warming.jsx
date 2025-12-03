@@ -2,7 +2,7 @@ import React, { useState, useEffect } from 'react';
 import { Mail, Users, Settings, Send, Plus, Trash2, Upload, Download, Clock, CheckCircle, XCircle, AlertCircle, RefreshCw, Flame, Zap, Eye, EyeOff } from 'lucide-react';
 
 // Configuration
-const API_BASE_URL = 'http://localhost:3001';
+const API_BASE_URL = 'https://cold-email-system-1.onrender.com';
 
 export default function ColdEmailToolWithWarming() {
   const [activeTab, setActiveTab] = useState('warming');
