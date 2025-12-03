@@ -660,6 +660,267 @@ app.get('/unsubscribe', (req, res) => {
   `);
 });
 
+// Homepage
+app.get('/', (req, res) => {
+  res.send(`
+    <!DOCTYPE html>
+    <html>
+      <head>
+        <title>Cold Email System API</title>
+        <meta name="viewport" content="width=device-width, initial-scale=1">
+        <style>
+          * { margin: 0; padding: 0; box-sizing: border-box; }
+          body {
+            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, Oxygen, Ubuntu, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+          }
+          .container {
+            max-width: 900px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 20px;
+            box-shadow: 0 20px 60px rgba(0,0,0,0.3);
+            overflow: hidden;
+          }
+          .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 40px;
+            text-align: center;
+          }
+          .header h1 {
+            font-size: 2.5em;
+            margin-bottom: 10px;
+          }
+          .status {
+            display: inline-block;
+            background: rgba(255,255,255,0.2);
+            padding: 10px 20px;
+            border-radius: 50px;
+            margin-top: 20px;
+          }
+          .status-dot {
+            display: inline-block;
+            width: 12px;
+            height: 12px;
+            background: #4ade80;
+            border-radius: 50%;
+            margin-right: 8px;
+            animation: pulse 2s infinite;
+          }
+          @keyframes pulse {
+            0%, 100% { opacity: 1; }
+            50% { opacity: 0.5; }
+          }
+          .content {
+            padding: 40px;
+          }
+          .stats {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+            gap: 20px;
+            margin-bottom: 40px;
+          }
+          .stat-card {
+            background: #f8fafc;
+            padding: 20px;
+            border-radius: 12px;
+            text-align: center;
+            border: 2px solid #e2e8f0;
+          }
+          .stat-value {
+            font-size: 2em;
+            font-weight: bold;
+            color: #667eea;
+            margin-bottom: 5px;
+          }
+          .stat-label {
+            color: #64748b;
+            font-size: 0.9em;
+          }
+          .section {
+            margin-bottom: 30px;
+          }
+          .section h2 {
+            color: #1e293b;
+            margin-bottom: 15px;
+            padding-bottom: 10px;
+            border-bottom: 2px solid #e2e8f0;
+          }
+          .endpoint {
+            background: #f8fafc;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 10px;
+            border-left: 4px solid #667eea;
+          }
+          .method {
+            display: inline-block;
+            background: #667eea;
+            color: white;
+            padding: 4px 12px;
+            border-radius: 4px;
+            font-size: 0.8em;
+            font-weight: bold;
+            margin-right: 10px;
+          }
+          .method.post { background: #10b981; }
+          .method.delete { background: #ef4444; }
+          .path {
+            font-family: 'Courier New', monospace;
+            color: #475569;
+          }
+          .description {
+            color: #64748b;
+            font-size: 0.9em;
+            margin-top: 5px;
+          }
+          .footer {
+            background: #f8fafc;
+            padding: 20px;
+            text-align: center;
+            color: #64748b;
+            font-size: 0.9em;
+          }
+          .footer a {
+            color: #667eea;
+            text-decoration: none;
+          }
+          .footer a:hover {
+            text-decoration: underline;
+          }
+        </style>
+      </head>
+      <body>
+        <div class="container">
+          <div class="header">
+            <h1>🚀 Cold Email System</h1>
+            <p>AI-Powered Email Warming & Campaign Management</p>
+            <div class="status">
+              <span class="status-dot"></span>
+              <span>System Online</span>
+            </div>
+          </div>
+          
+          <div class="content">
+            <div class="stats">
+              <div class="stat-card">
+                <div class="stat-value">${campaigns.size}</div>
+                <div class="stat-label">Cold Campaigns</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value">${warmingCampaigns.size}</div>
+                <div class="stat-label">Warming Campaigns</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value">${warmingAccounts.size}</div>
+                <div class="stat-label">Warm Accounts</div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-value">${emailQueue.length}</div>
+                <div class="stat-label">Queue Length</div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h2>📍 API Endpoints</h2>
+              
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/health</span>
+                <div class="description">System health check and statistics</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method post">POST</span>
+                <span class="path">/api/smtp/test</span>
+                <div class="description">Test SMTP connection with credentials</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method post">POST</span>
+                <span class="path">/api/warming/accounts</span>
+                <div class="description">Add new warming account</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/warming/accounts</span>
+                <div class="description">List all warming accounts</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method post">POST</span>
+                <span class="path">/api/warming/campaigns/start</span>
+                <div class="description">Start email warming campaign</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/warming/campaigns</span>
+                <div class="description">Get warming campaign status</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method post">POST</span>
+                <span class="path">/api/campaigns</span>
+                <div class="description">Create new cold email campaign</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/campaigns</span>
+                <div class="description">List all campaigns</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/campaigns/:id</span>
+                <div class="description">Get specific campaign details</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method post">POST</span>
+                <span class="path">/api/contacts</span>
+                <div class="description">Add contacts to campaign</div>
+              </div>
+
+              <div class="endpoint">
+                <span class="method">GET</span>
+                <span class="path">/api/contacts/:campaignId</span>
+                <div class="description">Get contacts for campaign</div>
+              </div>
+            </div>
+
+            <div class="section">
+              <h2>✨ Features</h2>
+              <div class="endpoint">
+                <strong>🔥 Email Warming:</strong> Automated account warming with AI-generated conversations
+              </div>
+              <div class="endpoint">
+                <strong>📧 Cold Campaigns:</strong> Personalized cold email campaigns with tracking
+              </div>
+              <div class="endpoint">
+                <strong>🤖 AI Responses:</strong> Claude-powered auto-responses to warming emails
+              </div>
+              <div class="endpoint">
+                <strong>📊 Analytics:</strong> Track opens, clicks, replies, and conversions
+              </div>
+            </div>
+          </div>
+
+          <div class="footer">
+            <p>Built with Node.js + Express | Deployed on Render</p>
+            <p><a href="/health">View Health Status</a></p>
+          </div>
+        </div>
+      </body>
+    </html>
+  `);
+});
+
 app.get('/health', (req, res) => {
   res.json({ 
     status: 'ok', 
