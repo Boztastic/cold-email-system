@@ -1,0 +1,9 @@
+services:
+  - type: web
+    name: cold-email-system
+    env: node
+    buildCommand: npm install
+    startCommand: node server-with-warming.js
+    envVars:
+      - key: NODE_ENV
+        value: production

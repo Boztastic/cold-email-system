@@ -1,0 +1,22 @@
+{
+  "name": "cold-email-system",
+  "version": "2.0.0",
+  "description": "Complete cold email campaign manager with AI-powered account warming",
+  "main": "server-with-warming.js",
+  "scripts": {
+    "start": "node server-with-warming.js"
+  },
+  "engines": {
+    "node": "18.x"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "nodemailer": "^6.9.7",
+    "imap": "^0.8.19",
+    "mailparser": "^3.6.5",
+    "express-rate-limit": "^7.1.5",
+    "helmet": "^7.1.0",
+    "dotenv": "^16.3.1"
+  }
+}
