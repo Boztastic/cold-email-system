@@ -20,6 +20,9 @@ const { WarmingScheduler } = require('./warming-engine');
 const app = express();
 const PORT = process.env.PORT || 10000;
 
+// Trust proxy for Render (required for rate limiting behind load balancer)
+app.set('trust proxy', 1);
+
 // Warming scheduler instance
 let warmingScheduler = null;
 
