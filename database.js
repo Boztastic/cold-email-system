@@ -403,6 +403,45 @@ async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_audit_created ON audit_logs(created_at);
     `);
 
+    // Warming configuration
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS warming_config (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        status VARCHAR(50) DEFAULT 'paused',
+        emails_per_day INTEGER DEFAULT 10,
+        ai_frequency DECIMAL(3,2) DEFAULT 0.30,
+        reply_probability DECIMAL(3,2) DEFAULT 0.80,
+        min_delay INTEGER DEFAULT 30,
+        max_delay INTEGER DEFAULT 180,
+        emails_sent_total INTEGER DEFAULT 0,
+        ai_emails_sent INTEGER DEFAULT 0,
+        replies_sent INTEGER DEFAULT 0,
+        last_email_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id)
+      );
+    `);
+
+    // Warming email log
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS warming_emails (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        sender_account_id UUID NOT NULL REFERENCES warming_accounts(id) ON DELETE CASCADE,
+        recipient_email VARCHAR(255) NOT NULL,
+        subject VARCHAR(500),
+        is_reply BOOLEAN DEFAULT false,
+        is_ai_generated BOOLEAN DEFAULT false,
+        opened BOOLEAN DEFAULT false,
+        replied BOOLEAN DEFAULT false,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_warming_emails_user ON warming_emails(user_id);
+      CREATE INDEX IF NOT EXISTS idx_warming_emails_created ON warming_emails(created_at);
+    `);
+
     // Updated_at trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION update_updated_at_column()
@@ -411,7 +450,7 @@ async function runMigrations() {
       $$ language 'plpgsql';
     `);
 
-    const tables = ['users', 'warming_accounts', 'contacts', 'email_templates', 'campaigns', 'sequences', 'cloudflare_configs', 'domains'];
+    const tables = ['users', 'warming_accounts', 'contacts', 'email_templates', 'campaigns', 'sequences', 'cloudflare_configs', 'domains', 'warming_config'];
     for (const table of tables) {
       await client.query(`
         DROP TRIGGER IF EXISTS update_${table}_updated_at ON ${table};

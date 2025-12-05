@@ -15,9 +15,13 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const db = require('./database');
 const security = require('./security');
+const { WarmingScheduler } = require('./warming-engine');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
+
+// Warming scheduler instance
+let warmingScheduler = null;
 
 // ============================================================================
 // CONFIGURATION
@@ -885,6 +889,83 @@ app.post('/api/smtp/test', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// AUTO WARMING ROUTES
+// ============================================================================
+
+// Get warming status and stats
+app.get('/api/warming/status', authenticateToken, async (req, res) => {
+  try {
+    if (!warmingScheduler) {
+      return res.json({ status: 'not_initialized' });
+    }
+    const stats = await warmingScheduler.getWarmingStats(req.user.id);
+    res.json(stats);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Start warming
+app.post('/api/warming/start', authenticateToken, async (req, res) => {
+  try {
+    if (!warmingScheduler) {
+      return res.status(500).json({ error: 'Warming system not initialized' });
+    }
+    
+    const { emailsPerDay = 10, aiFrequency = 0.3, replyProbability = 0.8 } = req.body;
+    
+    if (emailsPerDay < 1 || emailsPerDay > 50) {
+      return res.status(400).json({ error: 'Emails per day must be between 1 and 50' });
+    }
+    
+    const result = await warmingScheduler.startWarming(req.user.id, {
+      emailsPerDay: parseInt(emailsPerDay),
+      aiFrequency: parseFloat(aiFrequency),
+      replyProbability: parseFloat(replyProbability)
+    });
+    
+    security.createAuditLog('WARMING_STARTED', req.user.id, { emailsPerDay, aiFrequency }, req);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Stop warming
+app.post('/api/warming/stop', authenticateToken, async (req, res) => {
+  try {
+    if (!warmingScheduler) {
+      return res.status(500).json({ error: 'Warming system not initialized' });
+    }
+    
+    const result = await warmingScheduler.stopWarming(req.user.id);
+    security.createAuditLog('WARMING_STOPPED', req.user.id, {}, req);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get warming email history
+app.get('/api/warming/emails', authenticateToken, async (req, res) => {
+  try {
+    const { limit = 50 } = req.query;
+    const result = await db.query(`
+      SELECT we.*, wa.email as sender_email 
+      FROM warming_emails we
+      JOIN warming_accounts wa ON we.sender_account_id = wa.id
+      WHERE we.user_id = $1 
+      ORDER BY we.created_at DESC 
+      LIMIT $2
+    `, [req.user.id, Math.min(parseInt(limit), 100)]);
+    
+    res.json({ emails: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
 // CONTACT ROUTES (User-scoped)
 // ============================================================================
 
@@ -1505,7 +1586,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║  🔒 Cold Email System v3.1 - SECURE VERSION                    ║
+║  🔒 Cold Email System v3.2 - WITH AI WARMING                   ║
 ║                                                                ║
 ║  Port: ${PORT}                                                    ║
 ║  Database: ${process.env.DATABASE_URL ? '✅ Connected' : '❌ Not configured'}                               ║
@@ -1519,6 +1600,7 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  ✅ Rate limiting (global + per-user)                          ║
 ║  ✅ Strong password requirements                                ║
 ║  ✅ Audit logging                                               ║
+║  ✅ AI-powered email warming                                    ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
   `);
@@ -1526,8 +1608,36 @@ app.listen(PORT, '0.0.0.0', () => {
   // Security warnings
   if (!process.env.JWT_SECRET) console.warn('⚠️  Set JWT_SECRET environment variable!');
   if (!process.env.ENCRYPTION_KEY) console.warn('⚠️  Set ENCRYPTION_KEY environment variable!');
+  if (!process.env.ANTHROPIC_API_KEY) console.log('ℹ️  No ANTHROPIC_API_KEY set - using template-based warming');
   
   startEmailProcessor();
+  
+  // Initialize warming system
+  const initWarming = async () => {
+    warmingScheduler = new WarmingScheduler(db, {
+      sendWarmingEmail: async (senderAccount, recipientEmail, subject, body) => {
+        const decryptedPass = security.decrypt(senderAccount.smtp_pass);
+        const transporter = nodemailer.createTransport({
+          host: senderAccount.smtp_host,
+          port: senderAccount.smtp_port,
+          secure: senderAccount.smtp_port === 465,
+          auth: { user: senderAccount.smtp_user, pass: decryptedPass }
+        });
+        
+        await transporter.sendMail({
+          from: senderAccount.email,
+          to: recipientEmail,
+          subject: subject,
+          text: body.replace(/<[^>]*>/g, ''),
+          html: body.replace(/\n/g, '<br>')
+        });
+      }
+    });
+    
+    await warmingScheduler.restoreActiveJobs();
+    console.log('🔥 Warming system initialized');
+  };
+  initWarming().catch(err => console.error('Warming init error:', err));
 });
 
 process.on('SIGTERM', () => {
