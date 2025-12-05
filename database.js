@@ -424,12 +424,12 @@ async function runMigrations() {
       );
     `);
 
-    // Warming email log
+    // Warming email log (updated for Resend - no account reference needed)
     await client.query(`
       CREATE TABLE IF NOT EXISTS warming_emails (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
         user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-        sender_account_id UUID NOT NULL REFERENCES warming_accounts(id) ON DELETE CASCADE,
+        sender_email VARCHAR(255) NOT NULL,
         recipient_email VARCHAR(255) NOT NULL,
         subject VARCHAR(500),
         is_reply BOOLEAN DEFAULT false,
@@ -440,6 +440,28 @@ async function runMigrations() {
       );
       CREATE INDEX IF NOT EXISTS idx_warming_emails_user ON warming_emails(user_id);
       CREATE INDEX IF NOT EXISTS idx_warming_emails_created ON warming_emails(created_at);
+    `);
+
+    // Warming addresses (auto-created for each domain)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS warming_addresses (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        domain_id UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+        email_address VARCHAR(255) NOT NULL UNIQUE,
+        display_name VARCHAR(255),
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_warming_addresses_user ON warming_addresses(user_id);
+      CREATE INDEX IF NOT EXISTS idx_warming_addresses_domain ON warming_addresses(domain_id);
+    `);
+
+    // Add warming columns to domains table
+    await client.query(`
+      ALTER TABLE domains 
+      ADD COLUMN IF NOT EXISTS warming_enabled BOOLEAN DEFAULT false,
+      ADD COLUMN IF NOT EXISTS resend_domain_id VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS warming_status VARCHAR(50) DEFAULT 'not_configured';
     `);
 
     // Updated_at trigger

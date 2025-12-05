@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const db = require('./database');
 const security = require('./security');
-const { WarmingScheduler } = require('./warming-engine');
+const { ResendWarmingScheduler } = require('./warming-resend');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -892,7 +892,7 @@ app.post('/api/smtp/test', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
-// AUTO WARMING ROUTES
+// AUTO WARMING ROUTES (Resend-based)
 // ============================================================================
 
 // Get warming status and stats
@@ -912,7 +912,7 @@ app.get('/api/warming/status', authenticateToken, async (req, res) => {
 app.post('/api/warming/start', authenticateToken, async (req, res) => {
   try {
     if (!warmingScheduler) {
-      return res.status(500).json({ error: 'Warming system not initialized' });
+      return res.status(500).json({ error: 'Warming system not initialized. Add RESEND_API_KEY to environment.' });
     }
     
     const { emailsPerDay = 10, aiFrequency = 0.3, replyProbability = 0.8 } = req.body;
@@ -954,15 +954,104 @@ app.get('/api/warming/emails', authenticateToken, async (req, res) => {
   try {
     const { limit = 50 } = req.query;
     const result = await db.query(`
-      SELECT we.*, wa.email as sender_email 
-      FROM warming_emails we
-      JOIN warming_accounts wa ON we.sender_account_id = wa.id
-      WHERE we.user_id = $1 
-      ORDER BY we.created_at DESC 
+      SELECT * FROM warming_emails
+      WHERE user_id = $1 
+      ORDER BY created_at DESC 
       LIMIT $2
     `, [req.user.id, Math.min(parseInt(limit), 100)]);
     
     res.json({ emails: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Enable warming on a domain (auto-setup DNS + Resend)
+app.post('/api/domains/:id/enable-warming', authenticateToken, verifyOwnership('domains'), async (req, res) => {
+  try {
+    if (!warmingScheduler) {
+      return res.status(500).json({ error: 'Warming system not initialized. Add RESEND_API_KEY to environment.' });
+    }
+
+    // Get user's Cloudflare client
+    const cfConfig = await db.query(
+      'SELECT api_token, account_id FROM cloudflare_configs WHERE user_id = $1',
+      [req.user.id]
+    );
+    
+    if (cfConfig.rows.length === 0) {
+      return res.status(400).json({ error: 'Connect Cloudflare first' });
+    }
+
+    const decryptedToken = security.decrypt(cfConfig.rows[0].api_token);
+    const CloudflareClient = require('./warming-resend').ResendClient; // Reuse for structure
+    
+    // Create a simple Cloudflare client for DNS
+    const cloudflareClient = {
+      async createDNSRecord(zoneId, record) {
+        const response = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/dns_records`, {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${decryptedToken}`,
+            'Content-Type': 'application/json'
+          },
+          body: JSON.stringify({
+            type: record.type,
+            name: record.name,
+            content: record.content,
+            ttl: record.ttl || 3600,
+            priority: record.priority
+          })
+        });
+        const data = await response.json();
+        if (!data.success) {
+          throw new Error(data.errors?.[0]?.message || 'Failed to create DNS record');
+        }
+        return data.result;
+      }
+    };
+
+    const result = await warmingScheduler.setupDomainForWarming(
+      req.user.id,
+      req.params.id,
+      cloudflareClient
+    );
+
+    security.createAuditLog('DOMAIN_WARMING_ENABLED', req.user.id, { domainId: req.params.id }, req);
+    res.json(result);
+  } catch (error) {
+    console.error('Enable warming error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check domain warming verification status
+app.get('/api/domains/:id/warming-status', authenticateToken, verifyOwnership('domains'), async (req, res) => {
+  try {
+    if (!warmingScheduler) {
+      return res.json({ status: 'not_initialized' });
+    }
+
+    const result = await warmingScheduler.checkDomainVerification(req.params.id);
+    res.json(result);
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Get warming-enabled domains
+app.get('/api/warming/domains', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(`
+      SELECT d.id, d.domain_name, d.warming_enabled, d.warming_status,
+             array_agg(wa.email_address) as addresses
+      FROM domains d
+      LEFT JOIN warming_addresses wa ON wa.domain_id = d.id
+      WHERE d.user_id = $1 AND d.warming_enabled = true
+      GROUP BY d.id
+    `, [req.user.id]);
+    
+    res.json({ domains: result.rows });
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
@@ -1589,7 +1678,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║  🔒 Cold Email System v3.2 - WITH AI WARMING                   ║
+║  🔒 Cold Email System v3.3 - RESEND WARMING                    ║
 ║                                                                ║
 ║  Port: ${PORT}                                                    ║
 ║  Database: ${process.env.DATABASE_URL ? '✅ Connected' : '❌ Not configured'}                               ║
@@ -1611,34 +1700,21 @@ app.listen(PORT, '0.0.0.0', () => {
   // Security warnings
   if (!process.env.JWT_SECRET) console.warn('⚠️  Set JWT_SECRET environment variable!');
   if (!process.env.ENCRYPTION_KEY) console.warn('⚠️  Set ENCRYPTION_KEY environment variable!');
+  if (!process.env.RESEND_API_KEY) console.warn('⚠️  Set RESEND_API_KEY for email warming');
   if (!process.env.ANTHROPIC_API_KEY) console.log('ℹ️  No ANTHROPIC_API_KEY set - using template-based warming');
   
   startEmailProcessor();
   
-  // Initialize warming system
+  // Initialize Resend warming system
   const initWarming = async () => {
-    warmingScheduler = new WarmingScheduler(db, {
-      sendWarmingEmail: async (senderAccount, recipientEmail, subject, body) => {
-        const decryptedPass = security.decrypt(senderAccount.smtp_pass);
-        const transporter = nodemailer.createTransport({
-          host: senderAccount.smtp_host,
-          port: senderAccount.smtp_port,
-          secure: senderAccount.smtp_port === 465,
-          auth: { user: senderAccount.smtp_user, pass: decryptedPass }
-        });
-        
-        await transporter.sendMail({
-          from: senderAccount.email,
-          to: recipientEmail,
-          subject: subject,
-          text: body.replace(/<[^>]*>/g, ''),
-          html: body.replace(/\n/g, '<br>')
-        });
-      }
-    });
+    if (!process.env.RESEND_API_KEY) {
+      console.log('ℹ️  Warming disabled - add RESEND_API_KEY to enable');
+      return;
+    }
     
+    warmingScheduler = new ResendWarmingScheduler(db);
     await warmingScheduler.restoreActiveJobs();
-    console.log('🔥 Warming system initialized');
+    console.log('🔥 Resend warming system initialized');
   };
   initWarming().catch(err => console.error('Warming init error:', err));
 });
