@@ -464,6 +464,25 @@ async function runMigrations() {
       ADD COLUMN IF NOT EXISTS warming_status VARCHAR(50) DEFAULT 'not_configured';
     `);
 
+    // Migration: Update warming_emails for Resend (add sender_email if missing)
+    await client.query(`
+      ALTER TABLE warming_emails 
+      ADD COLUMN IF NOT EXISTS sender_email VARCHAR(255),
+      ADD COLUMN IF NOT EXISTS recipient_email VARCHAR(255);
+    `);
+    
+    // Drop old FK constraint if it exists (was sender_account_id)
+    await client.query(`
+      ALTER TABLE warming_emails 
+      DROP CONSTRAINT IF EXISTS warming_emails_sender_account_id_fkey;
+    `);
+    
+    await client.query(`
+      ALTER TABLE warming_emails 
+      DROP COLUMN IF EXISTS sender_account_id,
+      DROP COLUMN IF EXISTS recipient_account_id;
+    `);
+
     // Updated_at trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION update_updated_at_column()
