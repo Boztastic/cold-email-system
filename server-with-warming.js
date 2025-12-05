@@ -22,6 +22,535 @@ const limiter = rateLimit({
 });
 app.use('/api/', limiter);
 
+// ============================================================================
+// BACKEND AUTHENTICATION WITH POSTGRESQL
+// Complete authentication system integrated with database
+// ============================================================================
+// 
+// INSERT THIS CODE into your server-with-warming.js file
+// after line 23 (after the rate limiter)
+//
+// ============================================================================
+
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const crypto = require('crypto');
+const db = require('./database'); // Database module
+
+// ============================================================================
+// CONFIGURATION
+// ============================================================================
+
+const JWT_SECRET = process.env.JWT_SECRET || 'your-super-secret-jwt-key-change-this-in-production';
+const FRONTEND_URL = process.env.FRONTEND_URL || 'http://localhost:3000';
+
+// Run migrations on startup
+db.runMigrations().catch(err => {
+  console.error('Failed to run migrations:', err);
+  process.exit(1);
+});
+
+// ============================================================================
+// MIDDLEWARE
+// ============================================================================
+
+// Authenticate JWT token
+const authenticateToken = async (req, res, next) => {
+  const authHeader = req.headers['authorization'];
+  const token = authHeader && authHeader.split(' ')[1];
+
+  if (!token) {
+    return res.status(401).json({ error: 'Access token required' });
+  }
+
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    const user = await db.findUserById(decoded.userId);
+    
+    if (!user) {
+      return res.status(401).json({ error: 'User not found' });
+    }
+    
+    if (!user.active) {
+      return res.status(403).json({ error: 'Account is inactive' });
+    }
+    
+    req.user = user;
+    next();
+  } catch (error) {
+    return res.status(403).json({ error: 'Invalid or expired token' });
+  }
+};
+
+// Require admin role
+const requireAdmin = (req, res, next) => {
+  if (req.user.role !== 'admin') {
+    return res.status(403).json({ error: 'Admin access required' });
+  }
+  next();
+};
+
+// ============================================================================
+// AUTHENTICATION ROUTES
+// ============================================================================
+
+// Login
+app.post('/api/auth/login', async (req, res) => {
+  try {
+    const { email, password } = req.body;
+
+    if (!email || !password) {
+      return res.status(400).json({ error: 'Email and password required' });
+    }
+
+    // Find user
+    const user = await db.findUserByEmail(email);
+    if (!user) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Check if account is active
+    if (!user.active) {
+      return res.status(403).json({ error: 'Account is inactive' });
+    }
+
+    // Verify password
+    const validPassword = await bcrypt.compare(password, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Invalid credentials' });
+    }
+
+    // Generate JWT
+    const token = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    // Return user data (without password)
+    res.json({
+      token,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        active: user.active
+      }
+    });
+  } catch (error) {
+    console.error('Login error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get current user
+app.get('/api/auth/me', authenticateToken, async (req, res) => {
+  try {
+    const user = await db.findUserById(req.user.id);
+    if (!user) {
+      return res.status(404).json({ error: 'User not found' });
+    }
+
+    res.json({
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        active: user.active
+      }
+    });
+  } catch (error) {
+    console.error('Get user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Change password
+app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
+  try {
+    const { currentPassword, newPassword } = req.body;
+
+    if (!currentPassword || !newPassword) {
+      return res.status(400).json({ error: 'Current and new password required' });
+    }
+
+    if (newPassword.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    // Get user with password
+    const user = await db.findUserByEmail(req.user.email);
+    
+    // Verify current password
+    const validPassword = await bcrypt.compare(currentPassword, user.password);
+    if (!validPassword) {
+      return res.status(401).json({ error: 'Current password is incorrect' });
+    }
+
+    // Update password
+    await db.updateUserPassword(req.user.id, newPassword);
+
+    res.json({ message: 'Password updated successfully' });
+  } catch (error) {
+    console.error('Change password error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// USER MANAGEMENT ROUTES (Admin Only)
+// ============================================================================
+
+// Get all users
+app.get('/api/users', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const users = await db.getAllUsers();
+    res.json({ users });
+  } catch (error) {
+    console.error('Get users error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Invite user
+app.post('/api/users/invite', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { email, role = 'user' } = req.body;
+
+    if (!email) {
+      return res.status(400).json({ error: 'Email required' });
+    }
+
+    // Check if user already exists
+    const existingUser = await db.findUserByEmail(email);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+
+    // Generate invitation token
+    const token = crypto.randomBytes(32).toString('hex');
+    const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000); // 7 days
+
+    // Save invitation
+    await db.createInvitation(token, email, role, expiresAt);
+
+    // Generate invitation link
+    const inviteLink = `${FRONTEND_URL}/accept-invite/${token}`;
+
+    res.json({
+      message: 'Invitation created',
+      inviteLink,
+      expiresAt
+    });
+  } catch (error) {
+    console.error('Invite user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Get all invitations
+app.get('/api/users/invitations', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const invitations = await db.getAllInvitations();
+    res.json({ invitations });
+  } catch (error) {
+    console.error('Get invitations error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Accept invitation (public)
+app.post('/api/users/accept-invite', async (req, res) => {
+  try {
+    const { token, name, password } = req.body;
+
+    if (!token || !name || !password) {
+      return res.status(400).json({ error: 'Token, name, and password required' });
+    }
+
+    if (password.length < 8) {
+      return res.status(400).json({ error: 'Password must be at least 8 characters' });
+    }
+
+    // Find invitation
+    const invitation = await db.findInvitationByToken(token);
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invalid or expired invitation' });
+    }
+
+    // Check if user already exists
+    const existingUser = await db.findUserByEmail(invitation.email);
+    if (existingUser) {
+      return res.status(400).json({ error: 'User already exists' });
+    }
+
+    // Create user
+    const user = await db.createUser(
+      invitation.email,
+      password,
+      name,
+      invitation.role
+    );
+
+    // Delete invitation
+    await db.deleteInvitation(token);
+
+    // Generate JWT
+    const authToken = jwt.sign(
+      { userId: user.id, email: user.email, role: user.role },
+      JWT_SECRET,
+      { expiresIn: '7d' }
+    );
+
+    res.json({
+      token: authToken,
+      user: {
+        id: user.id,
+        email: user.email,
+        name: user.name,
+        role: user.role,
+        active: user.active
+      }
+    });
+  } catch (error) {
+    console.error('Accept invite error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Verify invitation (public)
+app.get('/api/users/verify-invite/:token', async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    const invitation = await db.findInvitationByToken(token);
+    if (!invitation) {
+      return res.status(404).json({ error: 'Invalid or expired invitation' });
+    }
+
+    res.json({
+      email: invitation.email,
+      role: invitation.role,
+      expiresAt: invitation.expires_at
+    });
+  } catch (error) {
+    console.error('Verify invite error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Activate user
+app.post('/api/users/:id/activate', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    await db.updateUserStatus(id, true);
+
+    res.json({ message: 'User activated' });
+  } catch (error) {
+    console.error('Activate user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Deactivate user
+app.post('/api/users/:id/deactivate', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { id } = req.params;
+
+    // Prevent deactivating yourself
+    if (id === req.user.id) {
+      return res.status(400).json({ error: 'Cannot deactivate your own account' });
+    }
+
+    await db.updateUserStatus(id, false);
+
+    res.json({ message: 'User deactivated' });
+  } catch (error) {
+    console.error('Deactivate user error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// Delete invitation
+app.delete('/api/users/invitations/:token', authenticateToken, requireAdmin, async (req, res) => {
+  try {
+    const { token } = req.params;
+
+    await db.deleteInvitation(token);
+
+    res.json({ message: 'Invitation deleted' });
+  } catch (error) {
+    console.error('Delete invitation error:', error);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+});
+
+// ============================================================================
+// UPDATE EXISTING ROUTES TO USE DATABASE
+// ============================================================================
+
+// Health endpoint - updated to use database
+app.get('/health', async (req, res) => {
+  const stats = await db.getHealthStats();
+  res.json(stats);
+});
+
+// ============================================================================
+// PROTECTED ROUTES
+// Add authenticateToken middleware to your existing routes:
+//
+// Example:
+// app.get('/api/warming/accounts', authenticateToken, async (req, res) => { ... });
+// app.post('/api/campaigns', authenticateToken, async (req, res) => { ... });
+//
+// Routes to protect:
+// - /api/warming/* (all warming routes)
+// - /api/contacts/* (all contact routes)
+// - /api/campaigns/* (all campaign routes)
+// - /api/smtp/test
+//
+// Keep public:
+// - /health
+// - /
+// - /api/auth/* (login, accept-invite, verify-invite)
+// ============================================================================
+
+// Example: Update warming accounts route
+// REPLACE YOUR EXISTING warming routes with these database versions:
+
+app.get('/api/warming/accounts', authenticateToken, async (req, res) => {
+  try {
+    const accounts = await db.getAllWarmingAccounts();
+    res.json({ accounts });
+  } catch (error) {
+    console.error('Error fetching warming accounts:', error);
+    res.status(500).json({ error: 'Failed to fetch accounts' });
+  }
+});
+
+app.post('/api/warming/accounts', authenticateToken, async (req, res) => {
+  try {
+    const accountData = req.body;
+    const account = await db.createWarmingAccount(accountData);
+    res.json({ account });
+  } catch (error) {
+    console.error('Error creating warming account:', error);
+    res.status(500).json({ error: 'Failed to create account' });
+  }
+});
+
+app.delete('/api/warming/accounts/:id', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    await db.deleteWarmingAccount(id);
+    res.json({ message: 'Account deleted' });
+  } catch (error) {
+    console.error('Error deleting warming account:', error);
+    res.status(500).json({ error: 'Failed to delete account' });
+  }
+});
+
+// Example: Update contacts routes
+app.get('/api/contacts', authenticateToken, async (req, res) => {
+  try {
+    const contacts = await db.getAllContacts();
+    res.json({ contacts });
+  } catch (error) {
+    console.error('Error fetching contacts:', error);
+    res.status(500).json({ error: 'Failed to fetch contacts' });
+  }
+});
+
+app.post('/api/contacts', authenticateToken, async (req, res) => {
+  try {
+    const contactData = req.body;
+    
+    // Check if bulk import
+    if (Array.isArray(contactData)) {
+      const contacts = await db.bulkCreateContacts(contactData);
+      res.json({ contacts, count: contacts.length });
+    } else {
+      const contact = await db.createContact(contactData);
+      res.json({ contact });
+    }
+  } catch (error) {
+    console.error('Error creating contacts:', error);
+    res.status(500).json({ error: 'Failed to create contacts' });
+  }
+});
+
+// Example: Update campaigns routes
+app.get('/api/campaigns', authenticateToken, async (req, res) => {
+  try {
+    const campaigns = await db.getAllCampaigns();
+    res.json({ campaigns });
+  } catch (error) {
+    console.error('Error fetching campaigns:', error);
+    res.status(500).json({ error: 'Failed to fetch campaigns' });
+  }
+});
+
+app.post('/api/campaigns', authenticateToken, async (req, res) => {
+  try {
+    const campaignData = req.body;
+    const campaign = await db.createCampaign(campaignData);
+    res.json({ campaign });
+  } catch (error) {
+    console.error('Error creating campaign:', error);
+    res.status(500).json({ error: 'Failed to create campaign' });
+  }
+});
+
+app.post('/api/campaigns/:id/start', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaign = await db.updateCampaignStatus(id, 'sending');
+    res.json({ campaign });
+  } catch (error) {
+    console.error('Error starting campaign:', error);
+    res.status(500).json({ error: 'Failed to start campaign' });
+  }
+});
+
+app.post('/api/campaigns/:id/stop', authenticateToken, async (req, res) => {
+  try {
+    const { id } = req.params;
+    const campaign = await db.updateCampaignStatus(id, 'paused');
+    res.json({ campaign });
+  } catch (error) {
+    console.error('Error stopping campaign:', error);
+    res.status(500).json({ error: 'Failed to stop campaign' });
+  }
+});
+
+// ============================================================================
+// NOTES FOR INTEGRATION
+// ============================================================================
+//
+// 1. Install dependencies:
+//    npm install pg bcryptjs jsonwebtoken
+//
+// 2. Add these environment variables to Render:
+//    - DATABASE_URL (from PostgreSQL database)
+//    - JWT_SECRET (generate a random 32+ character string)
+//    - ADMIN_EMAIL (default admin email)
+//    - ADMIN_PASSWORD (default admin password)
+//    - FRONTEND_URL (your frontend URL)
+//
+// 3. Create database.js file in your project root
+//
+// 4. Update package.json to include new dependencies:
+//    "pg": "^8.11.3",
+//    "bcryptjs": "^2.4.3",
+//    "jsonwebtoken": "^9.0.2"
+//
+// 5. The database will auto-migrate on first startup
+//
+// ============================================================================
+
 // ============================================
 // AUTHENTICATION SYSTEM - INTEGRATED VERSION
 // Copy this AFTER line 23 (after app.use('/api/', limiter);)
