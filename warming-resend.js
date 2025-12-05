@@ -374,7 +374,7 @@ class ResendWarmingScheduler {
     const records = domainDetails.records || [];
 
     // Step 3: Add DNS records via Cloudflare
-    const zoneId = domain.cloudflare_zone_id;
+    const zoneId = domain.zone_id;
     if (!zoneId) {
       throw new Error('Domain not connected to Cloudflare');
     }
