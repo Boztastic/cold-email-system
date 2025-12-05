@@ -350,20 +350,23 @@ class ResendWarmingScheduler {
 
     console.log(`🔧 Setting up warming for ${domainName}...`);
 
-    // Step 1: Add domain to Resend
+    // Step 1: Check if domain already exists in Resend, or add it
     let resendDomain;
     try {
-      resendDomain = await this.resend.addDomain(domainName);
-      console.log(`✅ Added ${domainName} to Resend`);
-    } catch (error) {
-      // Domain might already exist
-      if (error.message.includes('already exists')) {
-        const domains = await this.resend.listDomains();
-        resendDomain = domains.data.find(d => d.name === domainName);
-        if (!resendDomain) throw error;
+      // First check if it already exists
+      const existingDomains = await this.resend.listDomains();
+      resendDomain = existingDomains.data?.find(d => d.name === domainName);
+      
+      if (resendDomain) {
+        console.log(`✅ Found existing domain ${domainName} in Resend (id: ${resendDomain.id})`);
       } else {
-        throw error;
+        // Add new domain
+        resendDomain = await this.resend.addDomain(domainName);
+        console.log(`✅ Added ${domainName} to Resend`);
       }
+    } catch (error) {
+      console.error('Resend domain error:', error.message);
+      throw error;
     }
 
     // Step 2: Get DNS records needed from Resend
