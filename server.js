@@ -1,6 +1,6 @@
 // ============================================================================
-// COLD EMAIL SYSTEM - COMPLETE SERVER WITH ALL FEATURES
-// Email Sending Engine, Tracking, Sequences, Templates, Analytics
+// COLD EMAIL SYSTEM - COMPLETE SERVER v3.0
+// All Features: Auth, Campaigns, Sequences, Templates, Tracking, Domains
 // ============================================================================
 
 require('dotenv').config();
@@ -12,6 +12,7 @@ const helmet = require('helmet');
 const bcrypt = require('bcryptjs');
 const jwt = require('jsonwebtoken');
 const crypto = require('crypto');
+const fetch = require('node-fetch');
 const db = require('./database');
 
 const app = express();
@@ -83,10 +84,259 @@ const requireAdmin = (req, res, next) => {
 };
 
 // ============================================================================
+// CLOUDFLARE CLIENT CLASS
+// ============================================================================
+
+class CloudflareClient {
+  constructor(apiToken, accountId) {
+    this.apiToken = apiToken;
+    this.accountId = accountId;
+    this.baseUrl = 'https://api.cloudflare.com/client/v4';
+  }
+
+  async request(endpoint, options = {}) {
+    const response = await fetch(`${this.baseUrl}${endpoint}`, {
+      ...options,
+      headers: {
+        'Authorization': `Bearer ${this.apiToken}`,
+        'Content-Type': 'application/json',
+        ...options.headers
+      }
+    });
+
+    const data = await response.json();
+    
+    if (!data.success) {
+      const errorMsg = data.errors?.[0]?.message || 'Cloudflare API error';
+      throw new Error(errorMsg);
+    }
+
+    return data;
+  }
+
+  async verifyConnection() {
+    try {
+      const data = await this.request('/user/tokens/verify');
+      return { valid: true, status: data.result?.status };
+    } catch (error) {
+      return { valid: false, error: error.message };
+    }
+  }
+
+  async getAccountDetails() {
+    const data = await this.request(`/accounts/${this.accountId}`);
+    return data.result;
+  }
+
+  async getZones() {
+    const data = await this.request(`/zones?account.id=${this.accountId}`);
+    return data.result || [];
+  }
+
+  async getZoneByDomain(domainName) {
+    const data = await this.request(`/zones?name=${domainName}&account.id=${this.accountId}`);
+    return data.result?.[0] || null;
+  }
+
+  async createZone(domainName) {
+    const data = await this.request('/zones', {
+      method: 'POST',
+      body: JSON.stringify({
+        name: domainName,
+        account: { id: this.accountId },
+        jump_start: true,
+        type: 'full'
+      })
+    });
+    return data.result;
+  }
+
+  async checkAvailabilityViaRegistrar(domainName) {
+    try {
+      const data = await this.request(
+        `/accounts/${this.accountId}/registrar/domains/${domainName}/available`,
+        { method: 'GET' }
+      );
+      return {
+        domain: domainName,
+        available: data.result?.available || false,
+        premium: data.result?.premium || false,
+        price: data.result?.price || null,
+        currency: data.result?.currency || 'USD'
+      };
+    } catch (error) {
+      return { domain: domainName, available: 'unknown', error: error.message };
+    }
+  }
+
+  async purchaseDomain(domainName, contactInfo) {
+    const data = await this.request(
+      `/accounts/${this.accountId}/registrar/domains`,
+      {
+        method: 'POST',
+        body: JSON.stringify({
+          name: domainName,
+          auto_renew: true,
+          years: 1,
+          registrant_contact: contactInfo
+        })
+      }
+    );
+    return {
+      success: true,
+      domain: data.result?.name,
+      expires_at: data.result?.expires_at,
+      status: data.result?.status
+    };
+  }
+
+  async getDnsRecords(zoneId) {
+    const data = await this.request(`/zones/${zoneId}/dns_records`);
+    return data.result || [];
+  }
+
+  async createDnsRecord(zoneId, record) {
+    const data = await this.request(`/zones/${zoneId}/dns_records`, {
+      method: 'POST',
+      body: JSON.stringify(record)
+    });
+    return data.result;
+  }
+
+  async updateDnsRecord(zoneId, recordId, record) {
+    const data = await this.request(`/zones/${zoneId}/dns_records/${recordId}`, {
+      method: 'PUT',
+      body: JSON.stringify(record)
+    });
+    return data.result;
+  }
+
+  async setupEmailRecords(zoneId, domainName) {
+    const results = { mx: [], spf: null, dmarc: null };
+    const existingRecords = await this.getDnsRecords(zoneId);
+
+    // MX records
+    const mxRecords = [
+      { priority: 10, server: 'route1.mx.cloudflare.net' },
+      { priority: 20, server: 'route2.mx.cloudflare.net' },
+      { priority: 30, server: 'route3.mx.cloudflare.net' }
+    ];
+
+    for (const mx of mxRecords) {
+      const existing = existingRecords.find(r => r.type === 'MX' && r.content === mx.server);
+      if (!existing) {
+        const record = await this.createDnsRecord(zoneId, {
+          type: 'MX', name: domainName, content: mx.server, priority: mx.priority, ttl: 3600
+        });
+        results.mx.push(record);
+      }
+    }
+
+    // SPF record
+    const spfValue = 'v=spf1 include:_spf.mx.cloudflare.net ~all';
+    const existingSpf = existingRecords.find(r => r.type === 'TXT' && r.content.includes('v=spf1'));
+    if (existingSpf) {
+      results.spf = await this.updateDnsRecord(zoneId, existingSpf.id, {
+        type: 'TXT', name: domainName, content: spfValue, ttl: 3600
+      });
+    } else {
+      results.spf = await this.createDnsRecord(zoneId, {
+        type: 'TXT', name: domainName, content: spfValue, ttl: 3600
+      });
+    }
+
+    // DMARC record
+    const dmarcValue = `v=DMARC1; p=quarantine; rua=mailto:dmarc@${domainName}`;
+    const existingDmarc = existingRecords.find(r => r.type === 'TXT' && r.name.startsWith('_dmarc'));
+    if (!existingDmarc) {
+      results.dmarc = await this.createDnsRecord(zoneId, {
+        type: 'TXT', name: `_dmarc.${domainName}`, content: dmarcValue, ttl: 3600
+      });
+    }
+
+    return results;
+  }
+
+  async enableEmailRouting(zoneId) {
+    const data = await this.request(`/zones/${zoneId}/email/routing/enable`, { method: 'POST' });
+    return data.result;
+  }
+
+  async createCatchAllForwarding(zoneId, forwardTo) {
+    try {
+      await this.request(`/accounts/${this.accountId}/email/routing/addresses`, {
+        method: 'POST',
+        body: JSON.stringify({ email: forwardTo })
+      });
+    } catch (error) {
+      // Address might already exist
+    }
+
+    const rule = await this.request(`/zones/${zoneId}/email/routing/rules`, {
+      method: 'POST',
+      body: JSON.stringify({
+        name: 'Catch-all forwarding',
+        enabled: true,
+        matchers: [{ type: 'all' }],
+        actions: [{ type: 'forward', value: [forwardTo] }]
+      })
+    });
+    return rule.result;
+  }
+
+  async fullDomainSetup(domainName, forwardTo) {
+    const results = { zone: null, dns: null, emailRouting: null, forwarding: null, errors: [] };
+
+    try {
+      let zone = await this.getZoneByDomain(domainName);
+      if (!zone) zone = await this.createZone(domainName);
+      results.zone = zone;
+
+      try { results.dns = await this.setupEmailRecords(zone.id, domainName); } 
+      catch (e) { results.errors.push(`DNS setup: ${e.message}`); }
+
+      try { await this.enableEmailRouting(zone.id); results.emailRouting = { enabled: true }; } 
+      catch (e) { results.errors.push(`Email routing: ${e.message}`); }
+
+      if (forwardTo) {
+        try { results.forwarding = await this.createCatchAllForwarding(zone.id, forwardTo); } 
+        catch (e) { results.errors.push(`Forwarding: ${e.message}`); }
+      }
+    } catch (error) {
+      results.errors.push(`Zone setup: ${error.message}`);
+    }
+
+    return results;
+  }
+}
+
+// Domain pricing
+const DOMAIN_PRICING = {
+  '.com': 9.15, '.net': 10.11, '.org': 9.93, '.io': 33.98, '.co': 11.99,
+  '.dev': 12.00, '.app': 14.00, '.xyz': 10.00, '.me': 15.00, '.ai': 20.00
+};
+
+function getEstimatedPrice(domain) {
+  const tld = '.' + domain.split('.').pop();
+  return DOMAIN_PRICING[tld] || 12.00;
+}
+
+// Helper to get user's Cloudflare client
+async function getUserCloudflareClient(userId) {
+  const result = await db.query(
+    'SELECT api_token, account_id FROM cloudflare_configs WHERE user_id = $1 AND is_valid = true',
+    [userId]
+  );
+  if (result.rows.length === 0) {
+    throw new Error('Cloudflare not configured. Please add your API credentials first.');
+  }
+  return new CloudflareClient(result.rows[0].api_token, result.rows[0].account_id);
+}
+
+// ============================================================================
 // EMAIL SENDING ENGINE
 // ============================================================================
 
-// Personalize email content with contact data
 function personalizeContent(template, contact) {
   let content = template;
   content = content.replace(/\{\{first_name\}\}/gi, contact.first_name || '');
@@ -100,35 +350,23 @@ function personalizeContent(template, contact) {
   return content.trim();
 }
 
-// Add tracking pixel to email body
 function addTrackingPixel(body, trackingId) {
   const pixelUrl = `${BACKEND_URL}/track/open/${trackingId}`;
   const pixel = `<img src="${pixelUrl}" width="1" height="1" style="display:none" alt="" />`;
-  
-  // If HTML, add before closing body tag
-  if (body.includes('</body>')) {
-    return body.replace('</body>', `${pixel}</body>`);
-  }
-  
-  // Otherwise add at the end
+  if (body.includes('</body>')) return body.replace('</body>', `${pixel}</body>`);
   return body + `<br/>${pixel}`;
 }
 
-// Wrap links for click tracking
 function wrapLinksForTracking(body, trackingId) {
   const linkRegex = /href=["'](https?:\/\/[^"']+)["']/gi;
-  
   return body.replace(linkRegex, (match, url) => {
-    // Don't wrap unsubscribe links
     if (url.includes('unsubscribe')) return match;
-    
     const encodedUrl = encodeURIComponent(url);
     const trackingUrl = `${BACKEND_URL}/track/click/${trackingId}?url=${encodedUrl}`;
     return `href="${trackingUrl}"`;
   });
 }
 
-// Add unsubscribe link to email
 function addUnsubscribeLink(body, email) {
   const unsubscribeUrl = `${BACKEND_URL}/unsubscribe?email=${encodeURIComponent(email)}`;
   const unsubscribeHtml = `
@@ -137,50 +375,29 @@ function addUnsubscribeLink(body, email) {
       <a href="${unsubscribeUrl}" style="color:#666;">Unsubscribe</a> from future emails
     </div>
   `;
-  
-  if (body.includes('</body>')) {
-    return body.replace('</body>', `${unsubscribeHtml}</body>`);
-  }
-  
+  if (body.includes('</body>')) return body.replace('</body>', `${unsubscribeHtml}</body>`);
   return body + unsubscribeHtml;
 }
 
-// Send a single email
 async function sendEmail(queueItem) {
   try {
-    // Get an available warming account
     const account = await db.getActiveWarmingAccount();
-    if (!account) {
-      throw new Error('No available sending accounts');
-    }
+    if (!account) throw new Error('No available sending accounts');
 
-    // Create transporter
     const transporter = nodemailer.createTransport({
       host: account.smtp_host,
       port: account.smtp_port,
       secure: account.smtp_port === 465,
-      auth: {
-        user: account.smtp_user,
-        pass: account.smtp_pass
-      }
+      auth: { user: account.smtp_user, pass: account.smtp_pass }
     });
 
-    // Get contact for personalization
     const contact = await db.getContactById(queueItem.contact_id);
-    if (!contact) {
-      throw new Error('Contact not found');
-    }
+    if (!contact) throw new Error('Contact not found');
+    if (await db.isUnsubscribed(contact.email)) throw new Error('Contact is unsubscribed');
 
-    // Check if unsubscribed
-    if (await db.isUnsubscribed(contact.email)) {
-      throw new Error('Contact is unsubscribed');
-    }
-
-    // Personalize content
     let subject = personalizeContent(queueItem.subject, contact);
     let body = personalizeContent(queueItem.body, contact);
 
-    // Create tracking record
     const tracking = await db.createTracking({
       campaign_id: queueItem.campaign_id,
       sequence_id: queueItem.sequence_id,
@@ -189,12 +406,10 @@ async function sendEmail(queueItem) {
       email_queue_id: queueItem.id
     });
 
-    // Add tracking to email
     body = addTrackingPixel(body, tracking.tracking_id);
     body = wrapLinksForTracking(body, tracking.tracking_id);
     body = addUnsubscribeLink(body, contact.email);
 
-    // Send email
     await transporter.sendMail({
       from: `"${queueItem.from_name}" <${account.email}>`,
       replyTo: queueItem.from_email,
@@ -203,7 +418,6 @@ async function sendEmail(queueItem) {
       html: body
     });
 
-    // Update records
     await db.updateQueueItemStatus(queueItem.id, 'sent');
     await db.updateWarmingAccountUsage(account.id);
     await db.updateDailyStats('emails_sent');
@@ -222,17 +436,13 @@ async function sendEmail(queueItem) {
   }
 }
 
-// Process email queue
 async function processEmailQueue() {
   try {
     const queueItems = await db.getNextQueuedEmails(5);
-    
     for (const item of queueItems) {
       await sendEmail(item);
-      // Rate limiting: wait between sends
       await new Promise(resolve => setTimeout(resolve, 2000));
     }
-    
     return queueItems.length;
   } catch (error) {
     console.error('Queue processing error:', error);
@@ -240,13 +450,10 @@ async function processEmailQueue() {
   }
 }
 
-// Process sequence emails
 async function processSequenceEmails() {
   try {
     const dueContacts = await db.getSequenceContactsDueForEmail();
-    
     for (const sc of dueContacts) {
-      // Add to queue
       await db.addToEmailQueue({
         sequence_id: sc.sequence_id,
         sequence_step_id: sc.id,
@@ -260,24 +467,19 @@ async function processSequenceEmails() {
         priority: 3
       });
 
-      // Get next step info
       const sequence = await db.getSequenceWithSteps(sc.sequence_id);
       const currentStepIndex = sequence.steps.findIndex(s => s.step_number === sc.current_step);
       const nextStep = sequence.steps[currentStepIndex + 1];
 
       if (nextStep) {
-        // Calculate next email time
         const nextEmailAt = new Date();
         nextEmailAt.setDate(nextEmailAt.getDate() + nextStep.delay_days);
         nextEmailAt.setHours(nextEmailAt.getHours() + nextStep.delay_hours);
-        
         await db.updateSequenceContactAfterSend(sc.id, nextStep.step_number, nextEmailAt);
       } else {
-        // Sequence completed for this contact
         await db.updateSequenceContactAfterSend(sc.id, null, null);
       }
     }
-    
     return dueContacts.length;
   } catch (error) {
     console.error('Sequence processing error:', error);
@@ -285,33 +487,26 @@ async function processSequenceEmails() {
   }
 }
 
-// Background job scheduler
 let emailJobInterval;
 function startEmailProcessor() {
   console.log('📧 Starting email processor...');
-  
-  // Process queue every 10 seconds
   emailJobInterval = setInterval(async () => {
     await processEmailQueue();
     await processSequenceEmails();
   }, 10000);
-  
-  // Reset daily counts at midnight
+
   const resetDaily = () => {
     const now = new Date();
     const tomorrow = new Date(now);
     tomorrow.setDate(tomorrow.getDate() + 1);
     tomorrow.setHours(0, 0, 0, 0);
-    
     const msUntilMidnight = tomorrow - now;
-    
     setTimeout(async () => {
       await db.resetDailyWarmingCounts();
       console.log('🔄 Daily warming counts reset');
-      resetDaily(); // Schedule next reset
+      resetDaily();
     }, msUntilMidnight);
   };
-  
   resetDaily();
 }
 
@@ -319,18 +514,16 @@ function startEmailProcessor() {
 // PUBLIC ROUTES
 // ============================================================================
 
-// Health check
 app.get('/health', async (req, res) => {
   const stats = await db.getHealthStats();
   res.json(stats);
 });
 
-// Root
 app.get('/', (req, res) => {
   res.json({
-    message: 'Cold Email System API v2.0',
+    message: 'Cold Email System API v3.0',
     status: 'online',
-    features: ['authentication', 'campaigns', 'sequences', 'templates', 'tracking', 'analytics']
+    features: ['authentication', 'campaigns', 'sequences', 'templates', 'tracking', 'analytics', 'domains']
   });
 });
 
@@ -338,103 +531,60 @@ app.get('/', (req, res) => {
 // TRACKING ROUTES (Public)
 // ============================================================================
 
-// Track email open (1x1 pixel)
 app.get('/track/open/:trackingId', async (req, res) => {
   try {
     const { trackingId } = req.params;
     const userAgent = req.headers['user-agent'] || '';
     const ip = req.ip || req.connection.remoteAddress;
-    
     await db.recordOpen(trackingId, userAgent, ip);
   } catch (error) {
     console.error('Track open error:', error);
   }
-  
-  // Return 1x1 transparent GIF
   const pixel = Buffer.from('R0lGODlhAQABAIAAAAAAAP///yH5BAEAAAAALAAAAAABAAEAAAIBRAA7', 'base64');
   res.set('Content-Type', 'image/gif');
   res.set('Cache-Control', 'no-store, no-cache, must-revalidate, private');
   res.send(pixel);
 });
 
-// Track link click
 app.get('/track/click/:trackingId', async (req, res) => {
   try {
     const { trackingId } = req.params;
     const { url } = req.query;
     const userAgent = req.headers['user-agent'] || '';
     const ip = req.ip || req.connection.remoteAddress;
-    
     await db.recordClick(trackingId, url, userAgent, ip);
-    
-    if (url) {
-      return res.redirect(decodeURIComponent(url));
-    }
+    if (url) return res.redirect(decodeURIComponent(url));
   } catch (error) {
     console.error('Track click error:', error);
   }
-  
   res.redirect(FRONTEND_URL);
 });
 
-// Unsubscribe page
 app.get('/unsubscribe', async (req, res) => {
   const { email } = req.query;
-  
   res.send(`
     <!DOCTYPE html>
     <html>
-    <head>
-      <title>Unsubscribe</title>
-      <style>
-        body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
-        .card { background: #f9fafb; border-radius: 12px; padding: 40px; }
-        h1 { color: #111827; margin-bottom: 16px; }
-        p { color: #6b7280; margin-bottom: 24px; }
-        button { background: linear-gradient(135deg, #667eea, #764ba2); color: white; border: none; padding: 12px 32px; border-radius: 8px; font-size: 16px; cursor: pointer; }
-        button:hover { opacity: 0.9; }
-        .success { color: #10b981; }
-      </style>
+    <head><title>Unsubscribe</title>
+    <style>body{font-family:system-ui,sans-serif;max-width:600px;margin:50px auto;padding:20px;text-align:center}.card{background:#f9fafb;border-radius:12px;padding:40px}h1{color:#111827;margin-bottom:16px}p{color:#6b7280;margin-bottom:24px}button{background:linear-gradient(135deg,#667eea,#764ba2);color:white;border:none;padding:12px 32px;border-radius:8px;font-size:16px;cursor:pointer}</style>
     </head>
-    <body>
-      <div class="card">
-        <h1>Unsubscribe</h1>
-        <p>Are you sure you want to unsubscribe <strong>${email}</strong> from our emails?</p>
-        <form action="/unsubscribe" method="POST">
-          <input type="hidden" name="email" value="${email}" />
-          <button type="submit">Yes, Unsubscribe Me</button>
-        </form>
-      </div>
-    </body>
+    <body><div class="card"><h1>Unsubscribe</h1><p>Are you sure you want to unsubscribe <strong>${email}</strong> from our emails?</p><form action="/unsubscribe" method="POST"><input type="hidden" name="email" value="${email}"/><button type="submit">Yes, Unsubscribe Me</button></form></div></body>
     </html>
   `);
 });
 
 app.post('/unsubscribe', express.urlencoded({ extended: true }), async (req, res) => {
   const { email } = req.body;
-  
   try {
     await db.unsubscribeContact(email, 'User requested', 'unsubscribe_page', req.ip);
     await db.updateDailyStats('emails_unsubscribed');
-    
     res.send(`
       <!DOCTYPE html>
       <html>
-      <head>
-        <title>Unsubscribed</title>
-        <style>
-          body { font-family: system-ui, sans-serif; max-width: 600px; margin: 50px auto; padding: 20px; text-align: center; }
-          .card { background: #d1fae5; border-radius: 12px; padding: 40px; }
-          h1 { color: #065f46; margin-bottom: 16px; }
-          p { color: #047857; }
-        </style>
+      <head><title>Unsubscribed</title>
+      <style>body{font-family:system-ui,sans-serif;max-width:600px;margin:50px auto;padding:20px;text-align:center}.card{background:#d1fae5;border-radius:12px;padding:40px}h1{color:#065f46;margin-bottom:16px}p{color:#047857}</style>
       </head>
-      <body>
-        <div class="card">
-          <h1>✓ Unsubscribed</h1>
-          <p>You've been successfully unsubscribed and won't receive any more emails from us.</p>
-        </div>
-      </body>
+      <body><div class="card"><h1>✓ Unsubscribed</h1><p>You've been successfully unsubscribed and won't receive any more emails from us.</p></div></body>
       </html>
     `);
   } catch (error) {
@@ -449,30 +599,16 @@ app.post('/unsubscribe', express.urlencoded({ extended: true }), async (req, res
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
-    if (!email || !password) {
-      return res.status(400).json({ error: 'Email and password required' });
-    }
+    if (!email || !password) return res.status(400).json({ error: 'Email and password required' });
 
     const user = await db.findUserByEmail(email);
-    if (!user || !user.active) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    if (!user || !user.active) return res.status(401).json({ error: 'Invalid credentials' });
 
     const validPassword = await bcrypt.compare(password, user.password);
-    if (!validPassword) {
-      return res.status(401).json({ error: 'Invalid credentials' });
-    }
+    if (!validPassword) return res.status(401).json({ error: 'Invalid credentials' });
 
-    const token = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
-    res.json({
-      token,
-      user: { id: user.id, email: user.email, name: user.name, role: user.role }
-    });
+    const token = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
+    res.json({ token, user: { id: user.id, email: user.email, name: user.name, role: user.role } });
   } catch (error) {
     console.error('Login error:', error);
     res.status(500).json({ error: 'Internal server error' });
@@ -489,13 +625,9 @@ app.post('/api/auth/change-password', authenticateToken, async (req, res) => {
     if (!currentPassword || !newPassword || newPassword.length < 8) {
       return res.status(400).json({ error: 'Valid passwords required' });
     }
-
     const user = await db.findUserByEmail(req.user.email);
     const valid = await bcrypt.compare(currentPassword, user.password);
-    if (!valid) {
-      return res.status(401).json({ error: 'Current password is incorrect' });
-    }
-
+    if (!valid) return res.status(401).json({ error: 'Current password is incorrect' });
     await db.updateUserPassword(req.user.id, newPassword);
     res.json({ message: 'Password updated successfully' });
   } catch (error) {
@@ -524,12 +656,7 @@ app.post('/api/users/invite', authenticateToken, requireAdmin, async (req, res) 
     const expiresAt = new Date(Date.now() + 7 * 24 * 60 * 60 * 1000);
 
     await db.createInvitation(token, email, role, expiresAt);
-
-    res.json({
-      message: 'Invitation created',
-      inviteLink: `${FRONTEND_URL}/accept-invite/${token}`,
-      expiresAt
-    });
+    res.json({ message: 'Invitation created', inviteLink: `${FRONTEND_URL}/accept-invite/${token}`, expiresAt });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
   }
@@ -553,12 +680,7 @@ app.post('/api/users/accept-invite', async (req, res) => {
     const user = await db.createUser(invitation.email, password, name, invitation.role);
     await db.deleteInvitation(token);
 
-    const authToken = jwt.sign(
-      { userId: user.id, email: user.email, role: user.role },
-      JWT_SECRET,
-      { expiresIn: '7d' }
-    );
-
+    const authToken = jwt.sign({ userId: user.id, email: user.email, role: user.role }, JWT_SECRET, { expiresIn: '7d' });
     res.json({ token: authToken, user });
   } catch (error) {
     res.status(500).json({ error: 'Internal server error' });
@@ -571,9 +693,7 @@ app.post('/api/users/:id/activate', authenticateToken, requireAdmin, async (req,
 });
 
 app.post('/api/users/:id/deactivate', authenticateToken, requireAdmin, async (req, res) => {
-  if (req.params.id === req.user.id) {
-    return res.status(400).json({ error: 'Cannot deactivate yourself' });
-  }
+  if (req.params.id === req.user.id) return res.status(400).json({ error: 'Cannot deactivate yourself' });
   await db.updateUserStatus(req.params.id, false);
   res.json({ message: 'User deactivated' });
 });
@@ -589,7 +709,6 @@ app.delete('/api/users/invitations/:token', authenticateToken, requireAdmin, asy
 
 app.get('/api/warming/accounts', authenticateToken, async (req, res) => {
   const accounts = await db.getAllWarmingAccounts();
-  // Don't expose passwords
   const safeAccounts = accounts.map(a => ({ ...a, smtp_pass: '***' }));
   res.json({ accounts: safeAccounts });
 });
@@ -612,9 +731,7 @@ app.post('/api/smtp/test', authenticateToken, async (req, res) => {
   try {
     const { smtp_host, smtp_port, smtp_user, smtp_pass } = req.body;
     const transporter = nodemailer.createTransport({
-      host: smtp_host,
-      port: smtp_port,
-      secure: smtp_port === 465,
+      host: smtp_host, port: smtp_port, secure: smtp_port === 465,
       auth: { user: smtp_user, pass: smtp_pass }
     });
     await transporter.verify();
@@ -714,23 +831,17 @@ app.post('/api/campaigns/:id/start', authenticateToken, async (req, res) => {
   try {
     const { contactIds } = req.body;
     const campaign = await db.getCampaignById(req.params.id);
-    
     if (!campaign) return res.status(404).json({ error: 'Campaign not found' });
-    
-    // Add contacts to queue
+
     let added = 0;
     for (const contactId of (contactIds || [])) {
       const contact = await db.getContactById(contactId);
       if (contact && !contact.unsubscribed) {
         await db.addToEmailQueue({
-          campaign_id: campaign.id,
-          contact_id: contact.id,
-          to_email: contact.email,
-          to_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
-          from_email: campaign.from_email,
-          from_name: campaign.from_name,
-          subject: campaign.subject,
-          body: campaign.body
+          campaign_id: campaign.id, contact_id: contact.id,
+          to_email: contact.email, to_name: `${contact.first_name || ''} ${contact.last_name || ''}`.trim(),
+          from_email: campaign.from_email, from_name: campaign.from_name,
+          subject: campaign.subject, body: campaign.body
         });
         added++;
       }
@@ -771,18 +882,11 @@ app.get('/api/sequences/:id', authenticateToken, async (req, res) => {
 app.post('/api/sequences', authenticateToken, async (req, res) => {
   try {
     const { name, description, from_name, from_email, steps } = req.body;
-    
-    const sequence = await db.createSequence({
-      name, description, from_name, from_email
-    }, req.user.id);
+    const sequence = await db.createSequence({ name, description, from_name, from_email }, req.user.id);
 
-    // Create steps
     if (steps && steps.length > 0) {
       for (let i = 0; i < steps.length; i++) {
-        await db.createSequenceStep(sequence.id, {
-          ...steps[i],
-          step_number: i + 1
-        });
+        await db.createSequenceStep(sequence.id, { ...steps[i], step_number: i + 1 });
       }
     }
 
@@ -855,6 +959,261 @@ app.get('/api/analytics/campaigns/:id', authenticateToken, async (req, res) => {
 });
 
 // ============================================================================
+// CLOUDFLARE CONFIG ROUTES
+// ============================================================================
+
+app.get('/api/cloudflare/config', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query(
+      'SELECT id, account_id, account_name, is_valid, created_at FROM cloudflare_configs WHERE user_id = $1',
+      [req.user.id]
+    );
+    if (result.rows.length === 0) return res.json({ configured: false });
+    res.json({ configured: true, config: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/cloudflare/config', authenticateToken, async (req, res) => {
+  try {
+    const { apiToken, accountId } = req.body;
+    if (!apiToken || !accountId) return res.status(400).json({ error: 'API token and Account ID required' });
+
+    const cf = new CloudflareClient(apiToken, accountId);
+    const verification = await cf.verifyConnection();
+    if (!verification.valid) return res.status(400).json({ error: 'Invalid Cloudflare credentials' });
+
+    let accountName = 'Unknown';
+    try { const account = await cf.getAccountDetails(); accountName = account.name; } catch (e) {}
+
+    await db.query(`
+      INSERT INTO cloudflare_configs (user_id, api_token, account_id, account_name, is_valid)
+      VALUES ($1, $2, $3, $4, true)
+      ON CONFLICT (user_id) DO UPDATE SET api_token = $2, account_id = $3, account_name = $4, is_valid = true, updated_at = NOW()
+    `, [req.user.id, apiToken, accountId, accountName]);
+
+    res.json({ success: true, message: 'Cloudflare connected successfully', accountName });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/cloudflare/config', authenticateToken, async (req, res) => {
+  try {
+    await db.query('DELETE FROM cloudflare_configs WHERE user_id = $1', [req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/cloudflare/zones', authenticateToken, async (req, res) => {
+  try {
+    const cf = await getUserCloudflareClient(req.user.id);
+    const zones = await cf.getZones();
+    res.json({ zones });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
+// DOMAIN ROUTES
+// ============================================================================
+
+app.post('/api/domains/search', authenticateToken, async (req, res) => {
+  try {
+    const { query } = req.body;
+    if (!query || query.length < 2) return res.status(400).json({ error: 'Search query must be at least 2 characters' });
+
+    const baseName = query.toLowerCase().replace(/[^a-z0-9-]/g, '').substring(0, 63);
+    const cf = await getUserCloudflareClient(req.user.id);
+
+    const tlds = ['.com', '.io', '.co', '.net', '.dev', '.app'];
+    const results = [];
+
+    for (const tld of tlds) {
+      const domain = baseName + tld;
+      try {
+        const availability = await cf.checkAvailabilityViaRegistrar(domain);
+        results.push({
+          domain, available: availability.available, premium: availability.premium || false,
+          price: availability.price || getEstimatedPrice(domain), currency: 'USD'
+        });
+      } catch (error) {
+        results.push({ domain, available: 'unknown', price: getEstimatedPrice(domain), currency: 'USD' });
+      }
+    }
+
+    res.json({ results });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/purchase', authenticateToken, async (req, res) => {
+  try {
+    const { domain, contactInfo } = req.body;
+    if (!domain) return res.status(400).json({ error: 'Domain name required' });
+
+    const cf = await getUserCloudflareClient(req.user.id);
+
+    const contact = contactInfo || {
+      first_name: req.user.name.split(' ')[0],
+      last_name: req.user.name.split(' ').slice(1).join(' ') || 'User',
+      email: req.user.email, phone: '+1.0000000000',
+      address: '123 Main St', city: 'San Francisco', state: 'CA', zip: '94102', country: 'US', organization: ''
+    };
+
+    const purchase = await cf.purchaseDomain(domain, contact);
+
+    await db.query(`
+      INSERT INTO domains (user_id, domain_name, status, expires_at)
+      VALUES ($1, $2, 'active', $3)
+      ON CONFLICT (domain_name) DO UPDATE SET status = 'active', expires_at = $3, updated_at = NOW()
+    `, [req.user.id, domain, purchase.expires_at]);
+
+    res.json({ success: true, domain: purchase.domain, message: 'Domain purchased successfully!' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/domains', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM domains WHERE user_id = $1 ORDER BY created_at DESC', [req.user.id]);
+    res.json({ domains: result.rows });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.get('/api/domains/:id', authenticateToken, async (req, res) => {
+  try {
+    const result = await db.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (result.rows.length === 0) return res.status(404).json({ error: 'Domain not found' });
+    const domain = result.rows[0];
+    const dnsRecords = await db.query('SELECT * FROM domain_dns_records WHERE domain_id = $1', [domain.id]);
+    domain.dnsRecords = dnsRecords.rows;
+    res.json({ domain });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/add-existing', authenticateToken, async (req, res) => {
+  try {
+    const { domain } = req.body;
+    if (!domain) return res.status(400).json({ error: 'Domain name required' });
+
+    const cf = await getUserCloudflareClient(req.user.id);
+    let zone = await cf.getZoneByDomain(domain);
+    if (!zone) zone = await cf.createZone(domain);
+
+    const result = await db.query(`
+      INSERT INTO domains (user_id, domain_name, zone_id, status, registrar)
+      VALUES ($1, $2, $3, 'active', 'external')
+      ON CONFLICT (domain_name) DO UPDATE SET zone_id = $3, user_id = $1, status = 'active', updated_at = NOW()
+      RETURNING *
+    `, [req.user.id, domain, zone.id]);
+
+    res.json({ success: true, domain: result.rows[0], nameservers: zone.name_servers });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/:id/configure-dns', authenticateToken, async (req, res) => {
+  try {
+    const domainResult = await db.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (domainResult.rows.length === 0) return res.status(404).json({ error: 'Domain not found' });
+
+    const domain = domainResult.rows[0];
+    const cf = await getUserCloudflareClient(req.user.id);
+
+    let zone = domain.zone_id ? { id: domain.zone_id } : await cf.getZoneByDomain(domain.domain_name);
+    if (!zone) zone = await cf.createZone(domain.domain_name);
+
+    const dnsResults = await cf.setupEmailRecords(zone.id, domain.domain_name);
+
+    await db.query('UPDATE domains SET zone_id = $1, dns_configured = true, updated_at = NOW() WHERE id = $2', [zone.id, domain.id]);
+
+    res.json({ success: true, message: 'DNS configured successfully', records: dnsResults });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/:id/enable-email-routing', authenticateToken, async (req, res) => {
+  try {
+    const { forwardTo } = req.body;
+    const domainResult = await db.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (domainResult.rows.length === 0) return res.status(404).json({ error: 'Domain not found' });
+
+    const domain = domainResult.rows[0];
+    if (!domain.zone_id) return res.status(400).json({ error: 'Configure DNS first' });
+
+    const cf = await getUserCloudflareClient(req.user.id);
+    await cf.enableEmailRouting(domain.zone_id);
+    if (forwardTo) await cf.createCatchAllForwarding(domain.zone_id, forwardTo);
+
+    await db.query('UPDATE domains SET email_routing_enabled = true, forward_to = $1, updated_at = NOW() WHERE id = $2', [forwardTo || null, domain.id]);
+
+    res.json({ success: true, message: forwardTo ? `Email routing enabled. All emails to ${domain.domain_name} will forward to ${forwardTo}` : 'Email routing enabled' });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/:id/full-setup', authenticateToken, async (req, res) => {
+  try {
+    const { forwardTo } = req.body;
+    const domainResult = await db.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    if (domainResult.rows.length === 0) return res.status(404).json({ error: 'Domain not found' });
+
+    const domain = domainResult.rows[0];
+    const cf = await getUserCloudflareClient(req.user.id);
+    const results = await cf.fullDomainSetup(domain.domain_name, forwardTo);
+
+    await db.query(`
+      UPDATE domains SET zone_id = $1, dns_configured = true, email_routing_enabled = $2, forward_to = $3, updated_at = NOW() WHERE id = $4
+    `, [results.zone?.id, results.emailRouting?.enabled || false, forwardTo, domain.id]);
+
+    res.json({ success: true, message: 'Domain fully configured!', results, errors: results.errors });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.post('/api/domains/import', authenticateToken, async (req, res) => {
+  try {
+    const { zoneId, zoneName } = req.body;
+    if (!zoneId || !zoneName) return res.status(400).json({ error: 'Zone ID and name required' });
+
+    const result = await db.query(`
+      INSERT INTO domains (user_id, domain_name, zone_id, status, registrar)
+      VALUES ($1, $2, $3, 'active', 'cloudflare')
+      ON CONFLICT (domain_name) DO UPDATE SET zone_id = $3, user_id = $1, status = 'active', updated_at = NOW()
+      RETURNING *
+    `, [req.user.id, zoneName, zoneId]);
+
+    res.json({ success: true, domain: result.rows[0] });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+app.delete('/api/domains/:id', authenticateToken, async (req, res) => {
+  try {
+    await db.query('DELETE FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.id]);
+    res.json({ success: true });
+  } catch (error) {
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// ============================================================================
 // ERROR HANDLING
 // ============================================================================
 
@@ -875,7 +1234,7 @@ app.listen(PORT, '0.0.0.0', () => {
   console.log(`
 ╔════════════════════════════════════════════════════════════════╗
 ║                                                                ║
-║  🚀 Cold Email System v2.0 - All Features Enabled              ║
+║  🚀 Cold Email System v3.0 - ALL FEATURES ENABLED              ║
 ║                                                                ║
 ║  Port: ${PORT}                                                    ║
 ║  Database: ${process.env.DATABASE_URL ? '✅ Connected' : '❌ Not configured'}                               ║
@@ -888,15 +1247,13 @@ app.listen(PORT, '0.0.0.0', () => {
 ║  ✅ Open & Click Tracking                                       ║
 ║  ✅ Unsubscribe Management                                      ║
 ║  ✅ Analytics Dashboard                                         ║
+║  ✅ Domain Management (Cloudflare)                              ║
 ║                                                                ║
 ╚════════════════════════════════════════════════════════════════╝
   `);
-  
-  // Start background email processor
   startEmailProcessor();
 });
 
-// Graceful shutdown
 process.on('SIGTERM', () => {
   console.log('Shutting down...');
   clearInterval(emailJobInterval);

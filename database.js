@@ -1,6 +1,6 @@
 // ============================================================================
-// DATABASE MODULE - COMPLETE VERSION WITH ALL FEATURES
-// Includes: Users, Campaigns, Sequences, Templates, Tracking, Analytics
+// DATABASE MODULE - COMPLETE v3.0 WITH DOMAINS
+// All Tables: Users, Campaigns, Sequences, Templates, Tracking, Domains
 // ============================================================================
 
 const { Pool } = require('pg');
@@ -23,7 +23,6 @@ pool.on('error', (err) => {
   console.error('Unexpected error on idle database client', err);
 });
 
-// Test connection
 pool.query('SELECT NOW()', (err, res) => {
   if (err) {
     console.error('❌ Database connection failed:', err.message);
@@ -33,7 +32,7 @@ pool.query('SELECT NOW()', (err, res) => {
 });
 
 // ============================================================================
-// MIGRATION - RUN ON STARTUP
+// MIGRATION
 // ============================================================================
 
 async function runMigrations() {
@@ -42,12 +41,9 @@ async function runMigrations() {
   try {
     console.log('🔄 Running database migrations...');
     
-    // Enable UUID extension
     await client.query('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"');
     
-    // ========================================
-    // USERS TABLE
-    // ========================================
+    // Users
     await client.query(`
       CREATE TABLE IF NOT EXISTS users (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -62,9 +58,7 @@ async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_users_email ON users(email);
     `);
     
-    // ========================================
-    // INVITATIONS TABLE
-    // ========================================
+    // Invitations
     await client.query(`
       CREATE TABLE IF NOT EXISTS invitations (
         token VARCHAR(255) PRIMARY KEY,
@@ -73,12 +67,9 @@ async function runMigrations() {
         expires_at TIMESTAMP WITH TIME ZONE NOT NULL,
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_invitations_email ON invitations(email);
     `);
     
-    // ========================================
-    // WARMING ACCOUNTS TABLE
-    // ========================================
+    // Warming Accounts
     await client.query(`
       CREATE TABLE IF NOT EXISTS warming_accounts (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -96,12 +87,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_warming_accounts_status ON warming_accounts(status);
     `);
 
-    // ========================================
-    // CONTACTS TABLE
-    // ========================================
+    // Contacts
     await client.query(`
       CREATE TABLE IF NOT EXISTS contacts (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -122,13 +110,10 @@ async function runMigrations() {
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS idx_contacts_email ON contacts(email);
-      CREATE INDEX IF NOT EXISTS idx_contacts_status ON contacts(status);
       CREATE INDEX IF NOT EXISTS idx_contacts_unsubscribed ON contacts(unsubscribed);
     `);
 
-    // ========================================
-    // EMAIL TEMPLATES TABLE
-    // ========================================
+    // Email Templates
     await client.query(`
       CREATE TABLE IF NOT EXISTS email_templates (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -141,12 +126,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_templates_category ON email_templates(category);
     `);
 
-    // ========================================
-    // CAMPAIGNS TABLE (Enhanced)
-    // ========================================
+    // Campaigns
     await client.query(`
       CREATE TABLE IF NOT EXISTS campaigns (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -174,13 +156,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_campaigns_status ON campaigns(status);
-      CREATE INDEX IF NOT EXISTS idx_campaigns_type ON campaigns(type);
     `);
 
-    // ========================================
-    // SEQUENCES TABLE (Follow-up Campaigns)
-    // ========================================
+    // Sequences
     await client.query(`
       CREATE TABLE IF NOT EXISTS sequences (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -196,12 +174,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_sequences_status ON sequences(status);
     `);
 
-    // ========================================
-    // SEQUENCE STEPS TABLE
-    // ========================================
+    // Sequence Steps
     await client.query(`
       CREATE TABLE IF NOT EXISTS sequence_steps (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -220,12 +195,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sequence_id, step_number)
       );
-      CREATE INDEX IF NOT EXISTS idx_sequence_steps_sequence ON sequence_steps(sequence_id);
     `);
 
-    // ========================================
-    // SEQUENCE CONTACTS TABLE
-    // ========================================
+    // Sequence Contacts
     await client.query(`
       CREATE TABLE IF NOT EXISTS sequence_contacts (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -241,14 +213,10 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
         UNIQUE(sequence_id, contact_id)
       );
-      CREATE INDEX IF NOT EXISTS idx_seq_contacts_sequence ON sequence_contacts(sequence_id);
-      CREATE INDEX IF NOT EXISTS idx_seq_contacts_status ON sequence_contacts(status);
       CREATE INDEX IF NOT EXISTS idx_seq_contacts_next_email ON sequence_contacts(next_email_at);
     `);
 
-    // ========================================
-    // EMAIL QUEUE TABLE
-    // ========================================
+    // Email Queue
     await client.query(`
       CREATE TABLE IF NOT EXISTS email_queue (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -273,12 +241,9 @@ async function runMigrations() {
       );
       CREATE INDEX IF NOT EXISTS idx_queue_status ON email_queue(status);
       CREATE INDEX IF NOT EXISTS idx_queue_scheduled ON email_queue(scheduled_at);
-      CREATE INDEX IF NOT EXISTS idx_queue_campaign ON email_queue(campaign_id);
     `);
 
-    // ========================================
-    // EMAIL TRACKING TABLE
-    // ========================================
+    // Email Tracking
     await client.query(`
       CREATE TABLE IF NOT EXISTS email_tracking (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -308,13 +273,9 @@ async function runMigrations() {
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
       CREATE INDEX IF NOT EXISTS idx_tracking_id ON email_tracking(tracking_id);
-      CREATE INDEX IF NOT EXISTS idx_tracking_campaign ON email_tracking(campaign_id);
-      CREATE INDEX IF NOT EXISTS idx_tracking_contact ON email_tracking(contact_id);
     `);
 
-    // ========================================
-    // UNSUBSCRIBES TABLE
-    // ========================================
+    // Unsubscribes
     await client.query(`
       CREATE TABLE IF NOT EXISTS unsubscribes (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -325,12 +286,9 @@ async function runMigrations() {
         ip_address VARCHAR(50),
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_unsubscribes_email ON unsubscribes(email);
     `);
 
-    // ========================================
-    // ANALYTICS EVENTS TABLE
-    // ========================================
+    // Analytics Events
     await client.query(`
       CREATE TABLE IF NOT EXISTS analytics_events (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
@@ -342,18 +300,13 @@ async function runMigrations() {
         metadata JSONB DEFAULT '{}',
         created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_analytics_type ON analytics_events(event_type);
-      CREATE INDEX IF NOT EXISTS idx_analytics_campaign ON analytics_events(campaign_id);
-      CREATE INDEX IF NOT EXISTS idx_analytics_created ON analytics_events(created_at);
     `);
 
-    // ========================================
-    // DAILY STATS TABLE (Aggregated)
-    // ========================================
+    // Daily Stats
     await client.query(`
       CREATE TABLE IF NOT EXISTS daily_stats (
         id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
-        date DATE NOT NULL,
+        date DATE NOT NULL UNIQUE,
         emails_sent INTEGER DEFAULT 0,
         emails_delivered INTEGER DEFAULT 0,
         emails_opened INTEGER DEFAULT 0,
@@ -362,32 +315,70 @@ async function runMigrations() {
         emails_bounced INTEGER DEFAULT 0,
         emails_unsubscribed INTEGER DEFAULT 0,
         new_contacts INTEGER DEFAULT 0,
-        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
-        UNIQUE(date)
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
       );
-      CREATE INDEX IF NOT EXISTS idx_daily_stats_date ON daily_stats(date);
     `);
 
-    // ========================================
-    // UPDATED_AT TRIGGER
-    // ========================================
+    // Cloudflare Configs
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS cloudflare_configs (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        api_token TEXT NOT NULL,
+        account_id VARCHAR(255) NOT NULL,
+        account_name VARCHAR(255),
+        is_valid BOOLEAN DEFAULT true,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        UNIQUE(user_id)
+      );
+    `);
+
+    // Domains
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS domains (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+        domain_name VARCHAR(255) UNIQUE NOT NULL,
+        zone_id VARCHAR(255),
+        registrar VARCHAR(100) DEFAULT 'cloudflare',
+        status VARCHAR(50) DEFAULT 'pending',
+        dns_configured BOOLEAN DEFAULT false,
+        email_routing_enabled BOOLEAN DEFAULT false,
+        forward_to VARCHAR(255),
+        expires_at TIMESTAMP WITH TIME ZONE,
+        auto_renew BOOLEAN DEFAULT true,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP,
+        updated_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_domains_user ON domains(user_id);
+    `);
+
+    // Domain DNS Records
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS domain_dns_records (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        domain_id UUID NOT NULL REFERENCES domains(id) ON DELETE CASCADE,
+        record_id VARCHAR(255),
+        record_type VARCHAR(20) NOT NULL,
+        name VARCHAR(255) NOT NULL,
+        content TEXT NOT NULL,
+        priority INTEGER,
+        ttl INTEGER DEFAULT 3600,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+    `);
+
+    // Updated_at trigger
     await client.query(`
       CREATE OR REPLACE FUNCTION update_updated_at_column()
       RETURNS TRIGGER AS $$
-      BEGIN
-        NEW.updated_at = CURRENT_TIMESTAMP;
-        RETURN NEW;
-      END;
+      BEGIN NEW.updated_at = CURRENT_TIMESTAMP; RETURN NEW; END;
       $$ language 'plpgsql';
     `);
 
-    // Apply triggers
-    const tablesWithUpdatedAt = [
-      'users', 'warming_accounts', 'contacts', 'email_templates', 
-      'campaigns', 'sequences'
-    ];
-    
-    for (const table of tablesWithUpdatedAt) {
+    const tables = ['users', 'warming_accounts', 'contacts', 'email_templates', 'campaigns', 'sequences', 'cloudflare_configs', 'domains'];
+    for (const table of tables) {
       await client.query(`
         DROP TRIGGER IF EXISTS update_${table}_updated_at ON ${table};
         CREATE TRIGGER update_${table}_updated_at BEFORE UPDATE ON ${table}
@@ -396,11 +387,7 @@ async function runMigrations() {
     }
 
     console.log('✅ Database migrations completed');
-    
-    // Create default admin user
     await createDefaultAdmin(client);
-    
-    // Insert default templates
     await insertDefaultTemplates(client);
     
   } catch (error) {
@@ -437,71 +424,16 @@ async function insertDefaultTemplates(client) {
     
     if (result.rows.length === 0) {
       const templates = [
-        {
-          name: 'Initial Outreach',
-          subject: 'Quick question about {{company}}',
-          body: `Hi {{first_name}},
-
-I came across {{company}} and was impressed by what you're building.
-
-I'm reaching out because I think we could help {{company}} with [your value proposition].
-
-Would you be open to a quick 15-minute call this week to explore this?
-
-Best regards`,
-          category: 'outreach'
-        },
-        {
-          name: 'Follow-up #1',
-          subject: 'Re: Quick question about {{company}}',
-          body: `Hi {{first_name}},
-
-I wanted to follow up on my previous email. I know you're busy, so I'll keep this short.
-
-[Reiterate key value proposition]
-
-Would you have 15 minutes this week for a quick chat?
-
-Best regards`,
-          category: 'follow-up'
-        },
-        {
-          name: 'Follow-up #2 (Final)',
-          subject: 'Closing the loop',
-          body: `Hi {{first_name}},
-
-I haven't heard back from you, so I'll assume the timing isn't right.
-
-If things change in the future, feel free to reach out. I'd be happy to help {{company}} with [value proposition].
-
-Wishing you all the best!
-
-Best regards`,
-          category: 'follow-up'
-        },
-        {
-          name: 'Meeting Request',
-          subject: 'Meeting request - {{first_name}}',
-          body: `Hi {{first_name}},
-
-I'd love to schedule a quick call to discuss how we can help {{company}}.
-
-Are you available any of these times?
-- [Time option 1]
-- [Time option 2]
-- [Time option 3]
-
-Looking forward to connecting!
-
-Best regards`,
-          category: 'meeting'
-        }
+        { name: 'Initial Outreach', subject: 'Quick question about {{company}}', body: `Hi {{first_name}},\n\nI came across {{company}} and was impressed by what you're building.\n\nI'm reaching out because I think we could help {{company}} with [your value proposition].\n\nWould you be open to a quick 15-minute call this week to explore this?\n\nBest regards`, category: 'outreach' },
+        { name: 'Follow-up #1', subject: 'Re: Quick question about {{company}}', body: `Hi {{first_name}},\n\nI wanted to follow up on my previous email. I know you're busy, so I'll keep this short.\n\n[Reiterate key value proposition]\n\nWould you have 15 minutes this week for a quick chat?\n\nBest regards`, category: 'follow-up' },
+        { name: 'Follow-up #2 (Final)', subject: 'Closing the loop', body: `Hi {{first_name}},\n\nI haven't heard back from you, so I'll assume the timing isn't right.\n\nIf things change in the future, feel free to reach out. I'd be happy to help {{company}} with [value proposition].\n\nWishing you all the best!\n\nBest regards`, category: 'follow-up' },
+        { name: 'Meeting Request', subject: 'Meeting request - {{first_name}}', body: `Hi {{first_name}},\n\nI'd love to schedule a quick call to discuss how we can help {{company}}.\n\nAre you available any of these times?\n- [Time option 1]\n- [Time option 2]\n- [Time option 3]\n\nLooking forward to connecting!\n\nBest regards`, category: 'meeting' }
       ];
 
-      for (const template of templates) {
+      for (const t of templates) {
         await client.query(
           `INSERT INTO email_templates (name, subject, body, category, is_default) VALUES ($1, $2, $3, $4, $5)`,
-          [template.name, template.subject, template.body, template.category, true]
+          [t.name, t.subject, t.body, t.category, true]
         );
       }
       console.log('✅ Default email templates created');
@@ -512,7 +444,7 @@ Best regards`,
 }
 
 // ============================================================================
-// GENERIC QUERY HELPERS
+// QUERY HELPERS
 // ============================================================================
 
 async function query(text, params) {
@@ -520,9 +452,7 @@ async function query(text, params) {
   try {
     const res = await pool.query(text, params);
     const duration = Date.now() - start;
-    if (duration > 100) {
-      console.log('Slow query', { text, duration, rows: res.rowCount });
-    }
+    if (duration > 100) console.log('Slow query', { text, duration, rows: res.rowCount });
     return res;
   } catch (error) {
     console.error('Database query error:', error);
@@ -540,26 +470,19 @@ async function findUserByEmail(email) {
 }
 
 async function findUserById(id) {
-  const result = await query(
-    'SELECT id, email, name, role, active, created_at FROM users WHERE id = $1',
-    [id]
-  );
+  const result = await query('SELECT id, email, name, role, active, created_at FROM users WHERE id = $1', [id]);
   return result.rows[0];
 }
 
 async function getAllUsers() {
-  const result = await query(
-    'SELECT id, email, name, role, active, created_at FROM users ORDER BY created_at DESC'
-  );
+  const result = await query('SELECT id, email, name, role, active, created_at FROM users ORDER BY created_at DESC');
   return result.rows;
 }
 
 async function createUser(email, password, name, role = 'user') {
   const hashedPassword = await bcrypt.hash(password, 10);
   const result = await query(
-    `INSERT INTO users (email, password, name, role, active)
-     VALUES ($1, $2, $3, $4, $5)
-     RETURNING id, email, name, role, active, created_at`,
+    `INSERT INTO users (email, password, name, role, active) VALUES ($1, $2, $3, $4, $5) RETURNING id, email, name, role, active, created_at`,
     [email, hashedPassword, name, role, true]
   );
   return result.rows[0];
@@ -579,25 +502,17 @@ async function updateUserPassword(id, newPassword) {
 // ============================================================================
 
 async function createInvitation(token, email, role, expiresAt) {
-  const result = await query(
-    'INSERT INTO invitations (token, email, role, expires_at) VALUES ($1, $2, $3, $4) RETURNING *',
-    [token, email, role, expiresAt]
-  );
+  const result = await query('INSERT INTO invitations (token, email, role, expires_at) VALUES ($1, $2, $3, $4) RETURNING *', [token, email, role, expiresAt]);
   return result.rows[0];
 }
 
 async function findInvitationByToken(token) {
-  const result = await query(
-    'SELECT * FROM invitations WHERE token = $1 AND expires_at > NOW()',
-    [token]
-  );
+  const result = await query('SELECT * FROM invitations WHERE token = $1 AND expires_at > NOW()', [token]);
   return result.rows[0];
 }
 
 async function getAllInvitations() {
-  const result = await query(
-    'SELECT * FROM invitations WHERE expires_at > NOW() ORDER BY created_at DESC'
-  );
+  const result = await query('SELECT * FROM invitations WHERE expires_at > NOW() ORDER BY created_at DESC');
   return result.rows;
 }
 
@@ -606,7 +521,7 @@ async function deleteInvitation(token) {
 }
 
 // ============================================================================
-// WARMING ACCOUNT FUNCTIONS
+// WARMING FUNCTIONS
 // ============================================================================
 
 async function getAllWarmingAccounts() {
@@ -615,30 +530,23 @@ async function getAllWarmingAccounts() {
 }
 
 async function getActiveWarmingAccount() {
-  // Get account with lowest usage today, round-robin style
   const result = await query(`
-    SELECT * FROM warming_accounts 
-    WHERE status = 'active' AND emails_sent_today < daily_limit
-    ORDER BY emails_sent_today ASC, last_used_at ASC NULLS FIRST
-    LIMIT 1
+    SELECT * FROM warming_accounts WHERE status = 'active' AND emails_sent_today < daily_limit
+    ORDER BY emails_sent_today ASC, last_used_at ASC NULLS FIRST LIMIT 1
   `);
   return result.rows[0];
 }
 
 async function createWarmingAccount(data) {
   const result = await query(
-    `INSERT INTO warming_accounts (email, smtp_host, smtp_port, smtp_user, smtp_pass, imap_host, imap_port)
-     VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
+    `INSERT INTO warming_accounts (email, smtp_host, smtp_port, smtp_user, smtp_pass, imap_host, imap_port) VALUES ($1, $2, $3, $4, $5, $6, $7) RETURNING *`,
     [data.email, data.smtp_host, data.smtp_port, data.smtp_user, data.smtp_pass, data.imap_host, data.imap_port]
   );
   return result.rows[0];
 }
 
 async function updateWarmingAccountUsage(id) {
-  await query(
-    `UPDATE warming_accounts SET emails_sent_today = emails_sent_today + 1, last_used_at = NOW() WHERE id = $1`,
-    [id]
-  );
+  await query(`UPDATE warming_accounts SET emails_sent_today = emails_sent_today + 1, last_used_at = NOW() WHERE id = $1`, [id]);
 }
 
 async function resetDailyWarmingCounts() {
@@ -698,17 +606,8 @@ async function bulkCreateContacts(contacts) {
 }
 
 async function unsubscribeContact(email, reason = null, source = null, ip = null) {
-  await query(
-    `UPDATE contacts SET unsubscribed = true, unsubscribed_at = NOW(), status = 'unsubscribed' WHERE email = $1`,
-    [email]
-  );
-  
-  await query(
-    `INSERT INTO unsubscribes (email, reason, source, ip_address)
-     VALUES ($1, $2, $3, $4)
-     ON CONFLICT (email) DO NOTHING`,
-    [email, reason, source, ip]
-  );
+  await query(`UPDATE contacts SET unsubscribed = true, unsubscribed_at = NOW(), status = 'unsubscribed' WHERE email = $1`, [email]);
+  await query(`INSERT INTO unsubscribes (email, reason, source, ip_address) VALUES ($1, $2, $3, $4) ON CONFLICT (email) DO NOTHING`, [email, reason, source, ip]);
 }
 
 async function isUnsubscribed(email) {
@@ -717,7 +616,7 @@ async function isUnsubscribed(email) {
 }
 
 // ============================================================================
-// EMAIL TEMPLATE FUNCTIONS
+// TEMPLATE FUNCTIONS
 // ============================================================================
 
 async function getAllTemplates() {
@@ -732,8 +631,7 @@ async function getTemplateById(id) {
 
 async function createTemplate(data, userId) {
   const result = await query(
-    `INSERT INTO email_templates (name, subject, body, category, created_by)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    `INSERT INTO email_templates (name, subject, body, category, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
     [data.name, data.subject, data.body, data.category, userId]
   );
   return result.rows[0];
@@ -741,8 +639,7 @@ async function createTemplate(data, userId) {
 
 async function updateTemplate(id, data) {
   const result = await query(
-    `UPDATE email_templates SET name = $1, subject = $2, body = $3, category = $4, updated_at = NOW()
-     WHERE id = $5 RETURNING *`,
+    `UPDATE email_templates SET name = $1, subject = $2, body = $3, category = $4, updated_at = NOW() WHERE id = $5 RETURNING *`,
     [data.name, data.subject, data.body, data.category, id]
   );
   return result.rows[0];
@@ -781,8 +678,7 @@ async function updateCampaignStatus(id, status) {
   if (status === 'sent' || status === 'completed') updates.completed_at = new Date();
   
   const result = await query(
-    `UPDATE campaigns SET status = $1, started_at = COALESCE($2, started_at), completed_at = COALESCE($3, completed_at)
-     WHERE id = $4 RETURNING *`,
+    `UPDATE campaigns SET status = $1, started_at = COALESCE($2, started_at), completed_at = COALESCE($3, completed_at) WHERE id = $4 RETURNING *`,
     [status, updates.started_at || null, updates.completed_at || null, id]
   );
   return result.rows[0];
@@ -809,20 +705,14 @@ async function getSequenceById(id) {
 async function getSequenceWithSteps(id) {
   const sequence = await getSequenceById(id);
   if (!sequence) return null;
-  
-  const steps = await query(
-    'SELECT * FROM sequence_steps WHERE sequence_id = $1 ORDER BY step_number ASC',
-    [id]
-  );
-  
+  const steps = await query('SELECT * FROM sequence_steps WHERE sequence_id = $1 ORDER BY step_number ASC', [id]);
   sequence.steps = steps.rows;
   return sequence;
 }
 
 async function createSequence(data, userId) {
   const result = await query(
-    `INSERT INTO sequences (name, description, from_name, from_email, created_by)
-     VALUES ($1, $2, $3, $4, $5) RETURNING *`,
+    `INSERT INTO sequences (name, description, from_name, from_email, created_by) VALUES ($1, $2, $3, $4, $5) RETURNING *`,
     [data.name, data.description, data.from_name, data.from_email, userId]
   );
   return result.rows[0];
@@ -844,9 +734,7 @@ async function addContactsToSequence(sequenceId, contactIds) {
   for (const contactId of contactIds) {
     try {
       await query(
-        `INSERT INTO sequence_contacts (sequence_id, contact_id, next_email_at)
-         VALUES ($1, $2, $3)
-         ON CONFLICT (sequence_id, contact_id) DO NOTHING`,
+        `INSERT INTO sequence_contacts (sequence_id, contact_id, next_email_at) VALUES ($1, $2, $3) ON CONFLICT (sequence_id, contact_id) DO NOTHING`,
         [sequenceId, contactId, now]
       );
       added++;
@@ -855,49 +743,33 @@ async function addContactsToSequence(sequenceId, contactIds) {
     }
   }
   
-  await query(
-    'UPDATE sequences SET total_contacts = total_contacts + $1, active_contacts = active_contacts + $1 WHERE id = $2',
-    [added, sequenceId]
-  );
-  
+  await query('UPDATE sequences SET total_contacts = total_contacts + $1, active_contacts = active_contacts + $1 WHERE id = $2', [added, sequenceId]);
   return added;
 }
 
 async function getSequenceContactsDueForEmail() {
   const result = await query(`
-    SELECT sc.*, s.from_name, s.from_email, c.email, c.first_name, c.last_name, c.company, c.title,
-           ss.subject, ss.body
+    SELECT sc.*, s.from_name, s.from_email, c.email, c.first_name, c.last_name, c.company, c.title, ss.subject, ss.body
     FROM sequence_contacts sc
     JOIN sequences s ON sc.sequence_id = s.id
     JOIN contacts c ON sc.contact_id = c.id
     JOIN sequence_steps ss ON ss.sequence_id = s.id AND ss.step_number = sc.current_step
-    WHERE sc.status = 'active'
-      AND sc.next_email_at <= NOW()
-      AND s.status = 'active'
-      AND c.unsubscribed = false
-    ORDER BY sc.next_email_at ASC
-    LIMIT 100
+    WHERE sc.status = 'active' AND sc.next_email_at <= NOW() AND s.status = 'active' AND c.unsubscribed = false
+    ORDER BY sc.next_email_at ASC LIMIT 100
   `);
   return result.rows;
 }
 
 async function updateSequenceContactAfterSend(id, nextStep, nextEmailAt) {
   if (nextStep === null) {
-    // Sequence completed
-    await query(
-      `UPDATE sequence_contacts SET status = 'completed', completed_at = NOW(), last_email_at = NOW() WHERE id = $1`,
-      [id]
-    );
+    await query(`UPDATE sequence_contacts SET status = 'completed', completed_at = NOW(), last_email_at = NOW() WHERE id = $1`, [id]);
   } else {
-    await query(
-      `UPDATE sequence_contacts SET current_step = $1, next_email_at = $2, last_email_at = NOW() WHERE id = $3`,
-      [nextStep, nextEmailAt, id]
-    );
+    await query(`UPDATE sequence_contacts SET current_step = $1, next_email_at = $2, last_email_at = NOW() WHERE id = $3`, [nextStep, nextEmailAt, id]);
   }
 }
 
 // ============================================================================
-// EMAIL QUEUE FUNCTIONS
+// QUEUE FUNCTIONS
 // ============================================================================
 
 async function addToEmailQueue(data) {
@@ -911,25 +783,17 @@ async function addToEmailQueue(data) {
 
 async function getNextQueuedEmails(limit = 10) {
   const result = await query(`
-    SELECT * FROM email_queue
-    WHERE status = 'pending' AND scheduled_at <= NOW() AND retry_count < 3
-    ORDER BY priority ASC, scheduled_at ASC
-    LIMIT $1
+    SELECT * FROM email_queue WHERE status = 'pending' AND scheduled_at <= NOW() AND retry_count < 3
+    ORDER BY priority ASC, scheduled_at ASC LIMIT $1
   `, [limit]);
   return result.rows;
 }
 
 async function updateQueueItemStatus(id, status, errorMessage = null) {
   if (status === 'failed') {
-    await query(
-      `UPDATE email_queue SET status = $1, error_message = $2, retry_count = retry_count + 1 WHERE id = $3`,
-      [status, errorMessage, id]
-    );
+    await query(`UPDATE email_queue SET status = $1, error_message = $2, retry_count = retry_count + 1 WHERE id = $3`, [status, errorMessage, id]);
   } else {
-    await query(
-      `UPDATE email_queue SET status = $1, sent_at = CASE WHEN $1 = 'sent' THEN NOW() ELSE sent_at END WHERE id = $2`,
-      [status, id]
-    );
+    await query(`UPDATE email_queue SET status = $1, sent_at = CASE WHEN $1 = 'sent' THEN NOW() ELSE sent_at END WHERE id = $2`, [status, id]);
   }
 }
 
@@ -953,48 +817,30 @@ async function createTracking(data) {
 
 async function recordOpen(trackingId, userAgent, ip) {
   const result = await query(`
-    UPDATE email_tracking 
-    SET opened = true, 
-        opened_at = COALESCE(opened_at, NOW()), 
-        open_count = open_count + 1,
-        user_agent = $2,
-        ip_address = $3
-    WHERE tracking_id = $1
-    RETURNING *
+    UPDATE email_tracking SET opened = true, opened_at = COALESCE(opened_at, NOW()), open_count = open_count + 1, user_agent = $2, ip_address = $3
+    WHERE tracking_id = $1 RETURNING *
   `, [trackingId, userAgent, ip]);
   
   const tracking = result.rows[0];
   if (tracking) {
-    if (tracking.campaign_id) {
-      await updateCampaignStats(tracking.campaign_id, 'emails_opened');
-    }
+    if (tracking.campaign_id) await updateCampaignStats(tracking.campaign_id, 'emails_opened');
     await logAnalyticsEvent('open', tracking.campaign_id, tracking.sequence_id, tracking.contact_id, trackingId);
   }
-  
   return tracking;
 }
 
 async function recordClick(trackingId, link, userAgent, ip) {
   const result = await query(`
-    UPDATE email_tracking 
-    SET clicked = true, 
-        clicked_at = COALESCE(clicked_at, NOW()), 
-        click_count = click_count + 1,
-        clicked_links = clicked_links || $2::jsonb,
-        user_agent = $3,
-        ip_address = $4
-    WHERE tracking_id = $1
-    RETURNING *
+    UPDATE email_tracking SET clicked = true, clicked_at = COALESCE(clicked_at, NOW()), click_count = click_count + 1,
+    clicked_links = clicked_links || $2::jsonb, user_agent = $3, ip_address = $4
+    WHERE tracking_id = $1 RETURNING *
   `, [trackingId, JSON.stringify([{ link, timestamp: new Date() }]), userAgent, ip]);
   
   const tracking = result.rows[0];
   if (tracking) {
-    if (tracking.campaign_id) {
-      await updateCampaignStats(tracking.campaign_id, 'emails_clicked');
-    }
+    if (tracking.campaign_id) await updateCampaignStats(tracking.campaign_id, 'emails_clicked');
     await logAnalyticsEvent('click', tracking.campaign_id, tracking.sequence_id, tracking.contact_id, trackingId, { link });
   }
-  
   return tracking;
 }
 
@@ -1004,27 +850,18 @@ async function recordClick(trackingId, link, userAgent, ip) {
 
 async function logAnalyticsEvent(eventType, campaignId, sequenceId, contactId, trackingId, metadata = {}) {
   await query(
-    `INSERT INTO analytics_events (event_type, campaign_id, sequence_id, contact_id, tracking_id, metadata)
-     VALUES ($1, $2, $3, $4, $5, $6)`,
+    `INSERT INTO analytics_events (event_type, campaign_id, sequence_id, contact_id, tracking_id, metadata) VALUES ($1, $2, $3, $4, $5, $6)`,
     [eventType, campaignId, sequenceId, contactId, trackingId, JSON.stringify(metadata)]
   );
 }
 
 async function updateDailyStats(field) {
   const today = new Date().toISOString().split('T')[0];
-  await query(`
-    INSERT INTO daily_stats (date, ${field})
-    VALUES ($1, 1)
-    ON CONFLICT (date) DO UPDATE SET ${field} = daily_stats.${field} + 1
-  `, [today]);
+  await query(`INSERT INTO daily_stats (date, ${field}) VALUES ($1, 1) ON CONFLICT (date) DO UPDATE SET ${field} = daily_stats.${field} + 1`, [today]);
 }
 
 async function getDailyStats(days = 30) {
-  const result = await query(`
-    SELECT * FROM daily_stats
-    WHERE date >= CURRENT_DATE - INTERVAL '${days} days'
-    ORDER BY date ASC
-  `);
+  const result = await query(`SELECT * FROM daily_stats WHERE date >= CURRENT_DATE - INTERVAL '${days} days' ORDER BY date ASC`);
   return result.rows;
 }
 
@@ -1048,35 +885,17 @@ async function getCampaignAnalytics(campaignId) {
   const campaign = await getCampaignById(campaignId);
   if (!campaign) return null;
   
-  const openRate = campaign.emails_sent > 0 
-    ? ((campaign.emails_opened / campaign.emails_sent) * 100).toFixed(1) 
-    : 0;
-  const clickRate = campaign.emails_opened > 0 
-    ? ((campaign.emails_clicked / campaign.emails_opened) * 100).toFixed(1) 
-    : 0;
-  const replyRate = campaign.emails_sent > 0 
-    ? ((campaign.emails_replied / campaign.emails_sent) * 100).toFixed(1) 
-    : 0;
+  const openRate = campaign.emails_sent > 0 ? ((campaign.emails_opened / campaign.emails_sent) * 100).toFixed(1) : 0;
+  const clickRate = campaign.emails_opened > 0 ? ((campaign.emails_clicked / campaign.emails_opened) * 100).toFixed(1) : 0;
+  const replyRate = campaign.emails_sent > 0 ? ((campaign.emails_replied / campaign.emails_sent) * 100).toFixed(1) : 0;
   
-  return {
-    ...campaign,
-    openRate,
-    clickRate,
-    replyRate
-  };
+  return { ...campaign, openRate, clickRate, replyRate };
 }
-
-// ============================================================================
-// HEALTH CHECK
-// ============================================================================
 
 async function getHealthStats() {
   try {
     const stats = await getOverallStats();
-    return {
-      status: 'ok',
-      ...stats
-    };
+    return { status: 'ok', ...stats };
   } catch (error) {
     return { status: 'error', error: error.message };
   }
@@ -1087,81 +906,15 @@ async function getHealthStats() {
 // ============================================================================
 
 module.exports = {
-  pool,
-  query,
-  runMigrations,
-  
-  // Users
-  findUserByEmail,
-  findUserById,
-  getAllUsers,
-  createUser,
-  updateUserStatus,
-  updateUserPassword,
-  
-  // Invitations
-  createInvitation,
-  findInvitationByToken,
-  getAllInvitations,
-  deleteInvitation,
-  
-  // Warming
-  getAllWarmingAccounts,
-  getActiveWarmingAccount,
-  createWarmingAccount,
-  updateWarmingAccountUsage,
-  resetDailyWarmingCounts,
-  deleteWarmingAccount,
-  
-  // Contacts
-  getAllContacts,
-  getContactById,
-  getContactByEmail,
-  createContact,
-  bulkCreateContacts,
-  unsubscribeContact,
-  isUnsubscribed,
-  
-  // Templates
-  getAllTemplates,
-  getTemplateById,
-  createTemplate,
-  updateTemplate,
-  deleteTemplate,
-  
-  // Campaigns
-  getAllCampaigns,
-  getCampaignById,
-  createCampaign,
-  updateCampaignStatus,
-  updateCampaignStats,
-  
-  // Sequences
-  getAllSequences,
-  getSequenceById,
-  getSequenceWithSteps,
-  createSequence,
-  createSequenceStep,
-  addContactsToSequence,
-  getSequenceContactsDueForEmail,
-  updateSequenceContactAfterSend,
-  
-  // Queue
-  addToEmailQueue,
-  getNextQueuedEmails,
-  updateQueueItemStatus,
-  
-  // Tracking
-  generateTrackingId,
-  createTracking,
-  recordOpen,
-  recordClick,
-  
-  // Analytics
-  logAnalyticsEvent,
-  updateDailyStats,
-  getDailyStats,
-  getOverallStats,
-  getCampaignAnalytics,
-  getHealthStats
+  pool, query, runMigrations,
+  findUserByEmail, findUserById, getAllUsers, createUser, updateUserStatus, updateUserPassword,
+  createInvitation, findInvitationByToken, getAllInvitations, deleteInvitation,
+  getAllWarmingAccounts, getActiveWarmingAccount, createWarmingAccount, updateWarmingAccountUsage, resetDailyWarmingCounts, deleteWarmingAccount,
+  getAllContacts, getContactById, getContactByEmail, createContact, bulkCreateContacts, unsubscribeContact, isUnsubscribed,
+  getAllTemplates, getTemplateById, createTemplate, updateTemplate, deleteTemplate,
+  getAllCampaigns, getCampaignById, createCampaign, updateCampaignStatus, updateCampaignStats,
+  getAllSequences, getSequenceById, getSequenceWithSteps, createSequence, createSequenceStep, addContactsToSequence, getSequenceContactsDueForEmail, updateSequenceContactAfterSend,
+  addToEmailQueue, getNextQueuedEmails, updateQueueItemStatus,
+  generateTrackingId, createTracking, recordOpen, recordClick,
+  logAnalyticsEvent, updateDailyStats, getDailyStats, getOverallStats, getCampaignAnalytics, getHealthStats
 };

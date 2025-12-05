@@ -1,7 +1,7 @@
 {
   "name": "cold-email-system",
-  "version": "2.0.0",
-  "description": "Complete Cold Email System with Sequences, Tracking, and Analytics",
+  "version": "3.0.0",
+  "description": "Complete Cold Email System with Sequences, Tracking, Analytics, and Domain Management",
   "main": "server.js",
   "scripts": {
     "start": "node server.js",
@@ -16,8 +16,7 @@
     "bcryptjs": "^2.4.3",
     "jsonwebtoken": "^9.0.2",
     "nodemailer": "^6.9.7",
-    "imap": "^0.8.19",
-    "mailparser": "^3.6.5",
+    "node-fetch": "^2.7.0",
     "express-rate-limit": "^7.1.5"
   },
   "engines": {
@@ -27,6 +26,7 @@
     "cold-email",
     "email-marketing",
     "email-sequences",
-    "email-tracking"
+    "email-tracking",
+    "domain-management"
   ]
 }
