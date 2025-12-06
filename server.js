@@ -311,17 +311,22 @@ app.post('/api/domains/import', authenticateToken, async (req, res) => {
         const workerName = `email-inbox-${cleanDomain.replace(/\./g, '-')}`;
         const webhookUrl = `${WEBHOOK_BASE_URL}/api/webhook/email-receive`;
         
-        // Deploy worker
+        // Deploy worker using FormData for ES modules
         const workerScript = generateEmailWorkerScript(webhookUrl, webhookSecret);
+        const metadata = { main_module: 'worker.mjs' };
+        
+        const formData = new FormData();
+        formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+        formData.append('worker.mjs', new Blob([workerScript], { type: 'application/javascript+module' }), 'worker.mjs');
+        
         const workerResponse = await fetch(
           `${CF_API}/accounts/${CF_ACCOUNT_ID}/workers/scripts/${workerName}`,
           {
             method: 'PUT',
             headers: {
-              'Authorization': `Bearer ${CF_API_TOKEN}`,
-              'Content-Type': 'application/javascript'
+              'Authorization': `Bearer ${CF_API_TOKEN}`
             },
-            body: workerScript
+            body: formData
           }
         );
         
@@ -348,7 +353,8 @@ app.post('/api/domains/import', authenticateToken, async (req, res) => {
           inboxEnabled = true;
           setupLog.push({ step: 'Inbox', status: 'success', message: 'Email worker deployed' });
         } else {
-          setupLog.push({ step: 'Inbox', status: 'warning', message: 'Worker deployment failed' });
+          const errData = await workerResponse.json();
+          setupLog.push({ step: 'Inbox', status: 'warning', message: errData.errors?.[0]?.message || 'Worker deployment failed' });
         }
       } catch (err) {
         setupLog.push({ step: 'Inbox', status: 'warning', message: err.message });
@@ -564,11 +570,9 @@ const WEBHOOK_BASE_URL = process.env.WEBHOOK_BASE_URL || 'https://your-backend.o
 
 // Generate the Email Worker script
 function generateEmailWorkerScript(webhookUrl, webhookSecret) {
-  return `
-export default {
+  return `export default {
   async email(message, env, ctx) {
     try {
-      // Read email body
       const reader = message.raw.getReader();
       const chunks = [];
       while (true) {
@@ -578,7 +582,6 @@ export default {
       }
       const rawEmail = new TextDecoder().decode(new Uint8Array(chunks.flat()));
       
-      // Extract text body (simple extraction)
       let textBody = '';
       const lines = rawEmail.split('\\n');
       let inBody = false;
@@ -587,7 +590,6 @@ export default {
         if (line.trim() === '') inBody = true;
       }
       
-      // Send to webhook
       await fetch('${webhookUrl}', {
         method: 'POST',
         headers: {
@@ -626,18 +628,22 @@ async function deployEmailWorker(zoneId, domainName, userId) {
     [webhookSecret, zoneId]
   );
   
-  // 1. Deploy the worker script
+  // 1. Deploy the worker script using multipart form for ES modules
   const workerScript = generateEmailWorkerScript(webhookUrl, webhookSecret);
+  const metadata = { main_module: 'worker.mjs' };
+  
+  const formData = new FormData();
+  formData.append('metadata', new Blob([JSON.stringify(metadata)], { type: 'application/json' }));
+  formData.append('worker.mjs', new Blob([workerScript], { type: 'application/javascript+module' }), 'worker.mjs');
   
   const workerResponse = await fetch(
     `${CF_API}/accounts/${CF_ACCOUNT_ID}/workers/scripts/${workerName}`,
     {
       method: 'PUT',
       headers: {
-        'Authorization': `Bearer ${CF_API_TOKEN}`,
-        'Content-Type': 'application/javascript'
+        'Authorization': `Bearer ${CF_API_TOKEN}`
       },
-      body: workerScript
+      body: formData
     }
   );
   
