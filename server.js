@@ -15,7 +15,7 @@ const crypto = require('crypto');
 const fetch = require('node-fetch');
 const db = require('./database');
 const security = require('./security');
-const { ResendWarmingScheduler } = require('./warming-resend');
+const { ResendWarmingScheduler, verifyWebhookSignature, verifySimpleSignature, INBOUND_TABLE_SQL } = require('./warming-resend');
 
 const app = express();
 const PORT = process.env.PORT || 10000;
@@ -325,16 +325,88 @@ class CloudflareClient {
     return data.result;
   }
 
-  async createCatchAllForwarding(zoneId, forwardTo) {
+  async getEmailRoutingStatus(zoneId) {
     try {
-      await this.request(`/accounts/${this.accountId}/email/routing/addresses`, { method: 'POST', body: JSON.stringify({ email: forwardTo }) });
-    } catch (error) { /* Address might already exist */ }
+      const data = await this.request(`/zones/${zoneId}/email/routing`);
+      return data.result;
+    } catch (error) {
+      return { enabled: false };
+    }
+  }
 
-    const rule = await this.request(`/zones/${zoneId}/email/routing/rules`, {
-      method: 'POST',
-      body: JSON.stringify({ name: 'Catch-all forwarding', enabled: true, matchers: [{ type: 'all' }], actions: [{ type: 'forward', value: [forwardTo] }] })
+  async listDestinationAddresses() {
+    try {
+      const data = await this.request(`/accounts/${this.accountId}/email/routing/addresses`);
+      return data.result || [];
+    } catch (error) {
+      return [];
+    }
+  }
+
+  async createDestinationAddress(email) {
+    // Check if already exists
+    const existing = await this.listDestinationAddresses();
+    const found = existing.find(a => a.email === email);
+    if (found) {
+      return { ...found, alreadyExists: true };
+    }
+    
+    // Create new destination address (sends verification email)
+    const data = await this.request(`/accounts/${this.accountId}/email/routing/addresses`, { 
+      method: 'POST', 
+      body: JSON.stringify({ email }) 
     });
-    return rule.result;
+    return { ...data.result, alreadyExists: false };
+  }
+
+  async getCatchAllRule(zoneId) {
+    try {
+      const data = await this.request(`/zones/${zoneId}/email/routing/rules/catch_all`);
+      return data.result;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  async updateCatchAllRule(zoneId, forwardTo, enabled = true) {
+    const data = await this.request(`/zones/${zoneId}/email/routing/rules/catch_all`, {
+      method: 'PUT',
+      body: JSON.stringify({
+        enabled,
+        matchers: [{ type: 'all' }],
+        actions: [{ type: 'forward', value: [forwardTo] }]
+      })
+    });
+    return data.result;
+  }
+
+  async createCatchAllForwarding(zoneId, forwardTo) {
+    // First, ensure destination address exists
+    const destResult = await this.createDestinationAddress(forwardTo);
+    
+    // Check if verified
+    if (!destResult.verified) {
+      console.log(`⚠️  Destination ${forwardTo} needs verification. Check your email.`);
+      // Still try to set up catch-all - it will activate when verified
+    }
+
+    // Update catch-all rule (use PUT, not POST)
+    try {
+      const rule = await this.updateCatchAllRule(zoneId, forwardTo);
+      return { ...rule, destinationVerified: destResult.verified };
+    } catch (error) {
+      // Try creating via rules endpoint as fallback
+      const rule = await this.request(`/zones/${zoneId}/email/routing/rules`, {
+        method: 'POST',
+        body: JSON.stringify({ 
+          name: 'Catch-all forwarding', 
+          enabled: true, 
+          matchers: [{ type: 'all' }], 
+          actions: [{ type: 'forward', value: [forwardTo] }] 
+        })
+      });
+      return { ...rule.result, destinationVerified: destResult.verified };
+    }
   }
 
   async fullDomainSetup(domainName, forwardTo) {
@@ -1052,13 +1124,8 @@ app.post('/api/domains/:id/fix-bounces', authenticateToken, verifyOwnership('dom
       return res.status(400).json({ error: 'Domain not connected to Cloudflare' });
     }
 
-    // Get Cloudflare config
-    const cfConfig = await db.query('SELECT * FROM cloudflare_configs WHERE user_id = $1', [req.user.id]);
-    if (!cfConfig.rows[0]) {
-      return res.status(400).json({ error: 'Cloudflare not connected' });
-    }
-
-    const decryptedToken = security.decrypt(cfConfig.rows[0].api_token);
+    // Get Cloudflare client
+    const cf = await getUserCloudflareClient(req.user.id);
     
     // Get user's email for forwarding
     const userResult = await db.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
@@ -1070,48 +1137,102 @@ app.post('/api/domains/:id/fix-bounces', authenticateToken, verifyOwnership('dom
 
     const zoneId = domainData.zone_id;
     
-    // Enable email routing
-    const enableResponse = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/email/routing/enable`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${decryptedToken}`,
-        'Content-Type': 'application/json'
+    // Enable email routing (adds MX records automatically)
+    let routingEnabled = false;
+    try {
+      await cf.enableEmailRouting(zoneId);
+      routingEnabled = true;
+    } catch (error) {
+      // Might already be enabled
+      if (error.message.includes('already') || error.message.includes('enabled')) {
+        routingEnabled = true;
+      } else {
+        console.warn('Email routing enable warning:', error.message);
       }
-    });
+    }
     
-    // Create catch-all rule
-    const catchAllResponse = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/email/routing/rules`, {
-      method: 'POST',
-      headers: {
-        'Authorization': `Bearer ${decryptedToken}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        name: 'Catch-all for warming',
-        enabled: true,
-        matchers: [{ type: 'all' }],
-        actions: [{ type: 'forward', value: [forwardTo] }]
-      })
-    });
+    // Set up catch-all forwarding (creates destination address + rule)
+    let destinationVerified = false;
+    try {
+      const result = await cf.createCatchAllForwarding(zoneId, forwardTo);
+      destinationVerified = result.destinationVerified || false;
+    } catch (error) {
+      console.warn('Catch-all setup warning:', error.message);
+    }
 
     // Update database
     await db.query(`
       UPDATE domains SET 
-        email_routing_enabled = true,
-        forward_to = $1,
+        email_routing_enabled = $1,
+        destination_verified = $2,
+        forward_to = $3,
         updated_at = NOW()
-      WHERE id = $2
-    `, [forwardTo, req.params.id]);
+      WHERE id = $4
+    `, [routingEnabled, destinationVerified, forwardTo, req.params.id]);
 
-    console.log(`✅ Email routing enabled for ${domainData.domain_name} → ${forwardTo}`);
+    console.log(`✅ Email routing enabled for ${domainData.domain_name} → ${forwardTo} (verified: ${destinationVerified})`);
     
-    res.json({ 
-      success: true, 
-      message: `Email routing enabled. All emails will forward to ${forwardTo}`,
-      forwardTo 
-    });
+    if (!destinationVerified) {
+      res.json({ 
+        success: true, 
+        message: `Email routing enabled. Check ${forwardTo} for a verification email from Cloudflare and click the link to activate forwarding.`,
+        forwardTo,
+        verified: false,
+        action: 'verify_email'
+      });
+    } else {
+      res.json({ 
+        success: true, 
+        message: `Email routing active! All emails to *@${domainData.domain_name} will forward to ${forwardTo}`,
+        forwardTo,
+        verified: true
+      });
+    }
   } catch (error) {
     console.error('Fix bounces error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
+// Check email routing verification status
+app.get('/api/domains/:id/email-routing-status', authenticateToken, verifyOwnership('domains'), async (req, res) => {
+  try {
+    const domain = await db.query('SELECT * FROM domains WHERE id = $1', [req.params.id]);
+    if (!domain.rows[0]) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+    
+    const domainData = domain.rows[0];
+    if (!domainData.zone_id) {
+      return res.json({ enabled: false, verified: false, reason: 'No Cloudflare zone' });
+    }
+
+    const cf = await getUserCloudflareClient(req.user.id);
+    
+    // Check if email routing is enabled
+    const routingStatus = await cf.getEmailRoutingStatus(domainData.zone_id);
+    
+    // Check destination addresses
+    const destinations = await cf.listDestinationAddresses();
+    const forwardTo = domainData.forward_to;
+    const destinationAddr = destinations.find(d => d.email === forwardTo);
+    
+    const verified = destinationAddr?.verified || false;
+    
+    // Update database if verification changed
+    if (verified !== domainData.destination_verified) {
+      await db.query('UPDATE domains SET destination_verified = $1, updated_at = NOW() WHERE id = $2', 
+        [verified, req.params.id]);
+    }
+    
+    res.json({
+      enabled: routingStatus?.enabled || false,
+      verified,
+      forwardTo,
+      status: verified ? 'active' : (routingStatus?.enabled ? 'pending_verification' : 'disabled')
+    });
+  } catch (error) {
+    console.error('Email routing status error:', error);
     res.status(500).json({ error: error.message });
   }
 });
@@ -1120,7 +1241,8 @@ app.post('/api/domains/:id/fix-bounces', authenticateToken, verifyOwnership('dom
 app.get('/api/warming/domains', authenticateToken, async (req, res) => {
   try {
     const result = await db.query(`
-      SELECT d.id, d.domain_name, d.warming_enabled, d.warming_status,
+      SELECT d.id, d.domain_name, d.warming_enabled, d.warming_status, 
+             d.email_routing_enabled, d.destination_verified, d.forward_to,
              array_agg(wa.email_address) as addresses
       FROM domains d
       LEFT JOIN warming_addresses wa ON wa.domain_id = d.id
@@ -1132,6 +1254,126 @@ app.get('/api/warming/domains', authenticateToken, async (req, res) => {
   } catch (error) {
     res.status(500).json({ error: error.message });
   }
+});
+
+// =============================================================================
+// RESEND INBOUND WEBHOOK (Secure)
+// =============================================================================
+
+// Rate limiter for webhooks (100 per minute per IP)
+const webhookLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  max: 100,
+  message: { error: 'Too many webhook requests' },
+  standardHeaders: true,
+  legacyHeaders: false
+});
+
+// Webhook secret for verification
+const RESEND_WEBHOOK_SECRET = process.env.RESEND_WEBHOOK_SECRET;
+
+// Inbound email webhook from Resend
+app.post('/api/webhooks/resend/inbound', webhookLimiter, express.raw({ type: 'application/json' }), async (req, res) => {
+  const startTime = Date.now();
+  
+  try {
+    // Get raw body for signature verification
+    const rawBody = req.body.toString();
+    const signature = req.headers['svix-signature'] || req.headers['x-resend-signature'];
+
+    // Verify webhook signature if secret is configured
+    if (RESEND_WEBHOOK_SECRET) {
+      const isValid = verifyWebhookSignature(rawBody, signature, RESEND_WEBHOOK_SECRET) ||
+                      verifySimpleSignature(rawBody, signature, RESEND_WEBHOOK_SECRET);
+      
+      if (!isValid) {
+        console.warn('❌ Invalid webhook signature');
+        security.createAuditLog('WEBHOOK_INVALID_SIGNATURE', null, { 
+          ip: req.ip,
+          signature: signature?.substring(0, 20) + '...'
+        }, req);
+        return res.status(401).json({ error: 'Invalid signature' });
+      }
+    } else {
+      console.warn('⚠️  RESEND_WEBHOOK_SECRET not set - webhook signatures not verified');
+    }
+
+    // Parse the payload
+    let payload;
+    try {
+      payload = JSON.parse(rawBody);
+    } catch (e) {
+      console.error('Failed to parse webhook payload:', e);
+      return res.status(400).json({ error: 'Invalid JSON payload' });
+    }
+
+    // Log the webhook event
+    console.log(`📥 Webhook received: ${payload.type || 'email.received'}`);
+
+    // Handle different event types
+    const eventType = payload.type || 'email.received';
+    
+    if (eventType === 'email.received' || eventType === 'inbound') {
+      // Extract email data
+      const emailData = payload.data || payload;
+      
+      // Validate required fields
+      if (!emailData.from || !emailData.to) {
+        console.warn('Missing from/to in webhook payload');
+        return res.status(400).json({ error: 'Missing required fields' });
+      }
+
+      // Process the inbound email
+      if (warmingScheduler) {
+        const result = await warmingScheduler.processInboundEmail({
+          from: emailData.from,
+          to: emailData.to,
+          subject: emailData.subject || '(no subject)',
+          text: emailData.text || emailData.body,
+          html: emailData.html,
+          messageId: emailData.message_id || emailData.id,
+          headers: emailData.headers
+        });
+
+        console.log(`✅ Inbound processed in ${Date.now() - startTime}ms:`, result);
+        
+        // Log successful processing
+        security.createAuditLog('INBOUND_EMAIL_PROCESSED', null, {
+          from: emailData.from,
+          to: Array.isArray(emailData.to) ? emailData.to[0] : emailData.to,
+          processed: result.processed,
+          replied: result.replied
+        }, req);
+
+        return res.json({ success: true, ...result });
+      } else {
+        console.warn('Warming scheduler not initialized');
+        return res.status(503).json({ error: 'Warming system not ready' });
+      }
+    } else if (eventType === 'email.delivered' || eventType === 'email.bounced' || eventType === 'email.complained') {
+      // Log delivery status events
+      console.log(`📊 Email status: ${eventType}`, payload.data?.email_id);
+      return res.json({ success: true, event: eventType });
+    } else {
+      // Unknown event type - log but accept
+      console.log(`❓ Unknown webhook event: ${eventType}`);
+      return res.json({ success: true, event: eventType });
+    }
+  } catch (error) {
+    console.error('Webhook processing error:', error);
+    
+    // Don't expose internal errors
+    res.status(500).json({ error: 'Processing failed' });
+  }
+});
+
+// Webhook health check (for Resend to verify endpoint)
+app.get('/api/webhooks/resend/inbound', (req, res) => {
+  res.json({ 
+    status: 'ok', 
+    message: 'Resend inbound webhook endpoint',
+    timestamp: new Date().toISOString()
+  });
 });
 
 // ============================================================================

@@ -361,6 +361,7 @@ async function runMigrations() {
         status VARCHAR(50) DEFAULT 'pending',
         dns_configured BOOLEAN DEFAULT false,
         email_routing_enabled BOOLEAN DEFAULT false,
+        destination_verified BOOLEAN DEFAULT false,
         forward_to VARCHAR(255),
         expires_at TIMESTAMP WITH TIME ZONE,
         auto_renew BOOLEAN DEFAULT true,
@@ -456,12 +457,32 @@ async function runMigrations() {
       CREATE INDEX IF NOT EXISTS idx_warming_addresses_domain ON warming_addresses(domain_id);
     `);
 
+    // Inbound emails log (for Resend inbound webhook)
+    await client.query(`
+      CREATE TABLE IF NOT EXISTS inbound_emails (
+        id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+        user_id UUID REFERENCES users(id) ON DELETE CASCADE,
+        from_email VARCHAR(255) NOT NULL,
+        to_email VARCHAR(255) NOT NULL,
+        subject VARCHAR(500),
+        is_warming BOOLEAN DEFAULT false,
+        replied BOOLEAN DEFAULT false,
+        processed_at TIMESTAMP WITH TIME ZONE,
+        created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+      );
+      CREATE INDEX IF NOT EXISTS idx_inbound_emails_user ON inbound_emails(user_id);
+      CREATE INDEX IF NOT EXISTS idx_inbound_emails_created ON inbound_emails(created_at);
+      CREATE INDEX IF NOT EXISTS idx_inbound_emails_to ON inbound_emails(to_email);
+    `);
+
     // Add warming columns to domains table
     await client.query(`
       ALTER TABLE domains 
       ADD COLUMN IF NOT EXISTS warming_enabled BOOLEAN DEFAULT false,
       ADD COLUMN IF NOT EXISTS resend_domain_id VARCHAR(255),
-      ADD COLUMN IF NOT EXISTS warming_status VARCHAR(50) DEFAULT 'not_configured';
+      ADD COLUMN IF NOT EXISTS warming_status VARCHAR(50) DEFAULT 'not_configured',
+      ADD COLUMN IF NOT EXISTS inbound_enabled BOOLEAN DEFAULT false,
+      ADD COLUMN IF NOT EXISTS destination_verified BOOLEAN DEFAULT false;
     `);
 
     // Migration: Update warming_emails for Resend (add sender_email if missing)

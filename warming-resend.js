@@ -1,10 +1,73 @@
 // =============================================================================
 // RESEND WARMING ENGINE
 // Automated email warming using Resend API + Cloudflare DNS
-// No SMTP passwords needed - just domain verification
+// Includes secure inbound email handling via webhooks
 // =============================================================================
 
 const fetch = require('node-fetch');
+const crypto = require('crypto');
+
+// =============================================================================
+// WEBHOOK SIGNATURE VERIFICATION
+// =============================================================================
+
+function verifyWebhookSignature(payload, signature, secret) {
+  if (!signature || !secret) {
+    return false;
+  }
+
+  try {
+    // Resend uses Svix for webhooks - signature format: v1,timestamp,signature
+    const parts = signature.split(',');
+    if (parts.length < 3) return false;
+    
+    const timestamp = parts.find(p => p.startsWith('t='))?.split('=')[1];
+    const sig = parts.find(p => p.startsWith('v1='))?.split('=')[1];
+    
+    if (!timestamp || !sig) return false;
+
+    // Check timestamp is within 5 minutes
+    const now = Math.floor(Date.now() / 1000);
+    if (Math.abs(now - parseInt(timestamp)) > 300) {
+      console.warn('Webhook timestamp too old');
+      return false;
+    }
+
+    // Verify signature
+    const signedPayload = `${timestamp}.${payload}`;
+    const expectedSig = crypto
+      .createHmac('sha256', secret)
+      .update(signedPayload)
+      .digest('hex');
+
+    return crypto.timingSafeEqual(
+      Buffer.from(sig),
+      Buffer.from(expectedSig)
+    );
+  } catch (error) {
+    console.error('Webhook verification error:', error);
+    return false;
+  }
+}
+
+// Simple signature for non-Svix webhooks (fallback)
+function verifySimpleSignature(payload, signature, secret) {
+  if (!signature || !secret) return false;
+  
+  const expected = crypto
+    .createHmac('sha256', secret)
+    .update(typeof payload === 'string' ? payload : JSON.stringify(payload))
+    .digest('hex');
+  
+  try {
+    return crypto.timingSafeEqual(
+      Buffer.from(signature),
+      Buffer.from(expected)
+    );
+  } catch {
+    return signature === expected;
+  }
+}
 
 // =============================================================================
 // RESEND API CLIENT
@@ -379,6 +442,7 @@ class ResendWarmingScheduler {
       throw new Error('Domain not connected to Cloudflare');
     }
 
+    // Add Resend's sending records (SPF, DKIM, etc.)
     for (const record of records) {
       try {
         await cloudflareClient.createDNSRecord(zoneId, {
@@ -391,38 +455,60 @@ class ResendWarmingScheduler {
         console.log(`✅ Added ${record.type} record: ${record.name}`);
       } catch (error) {
         // Record might already exist
-        if (!error.message.includes('already exists')) {
+        if (!error.message.includes('already exists') && !error.message.includes('already been taken')) {
           console.warn(`⚠️  Failed to add ${record.type} record: ${error.message}`);
         }
       }
     }
 
-    // Step 4: Enable Email Routing (so warming emails don't bounce)
+    // Step 4: Enable Cloudflare Email Routing for receiving emails
+    // This automatically adds the correct MX records
+    let emailRoutingStatus = { enabled: false, destinationVerified: false };
     try {
       // Get user's email for forwarding
       const userResult = await this.db.query('SELECT email FROM users WHERE id = $1', [userId]);
-      const forwardTo = userResult.rows[0]?.email;
+      const userEmail = userResult.rows[0]?.email;
       
-      if (forwardTo) {
-        // Enable email routing on the zone
-        await cloudflareClient.enableEmailRouting(zoneId);
-        console.log(`✅ Enabled email routing for ${domainName}`);
+      if (userEmail) {
+        // Enable Email Routing (adds MX records automatically)
+        try {
+          await cloudflareClient.enableEmailRouting(zoneId);
+          console.log(`✅ Enabled Cloudflare Email Routing for ${domainName}`);
+          emailRoutingStatus.enabled = true;
+        } catch (error) {
+          // Might already be enabled
+          if (error.message.includes('already enabled') || error.message.includes('already exists')) {
+            emailRoutingStatus.enabled = true;
+          } else {
+            console.warn(`⚠️  Email routing enable warning: ${error.message}`);
+          }
+        }
         
-        // Create catch-all forwarding rule
-        await cloudflareClient.createCatchAllForwarding(zoneId, forwardTo);
-        console.log(`✅ Created catch-all forwarding to ${forwardTo}`);
-        
+        // Set up catch-all forwarding
+        try {
+          const forwardingResult = await cloudflareClient.createCatchAllForwarding(zoneId, userEmail);
+          emailRoutingStatus.destinationVerified = forwardingResult.destinationVerified;
+          
+          if (!forwardingResult.destinationVerified) {
+            console.log(`📧 Verification email sent to ${userEmail} - user must click to activate`);
+          } else {
+            console.log(`✅ Catch-all forwarding active: *@${domainName} → ${userEmail}`);
+          }
+        } catch (error) {
+          console.warn(`⚠️  Catch-all setup warning: ${error.message}`);
+        }
+
         // Update domain record
         await this.db.query(`
           UPDATE domains SET 
-            email_routing_enabled = true,
-            forward_to = $1,
+            email_routing_enabled = $1,
+            forward_to = $2,
+            destination_verified = $3,
             updated_at = NOW()
-          WHERE id = $2
-        `, [forwardTo, domainId]);
+          WHERE id = $4
+        `, [emailRoutingStatus.enabled, userEmail, emailRoutingStatus.destinationVerified, domainId]);
       }
     } catch (error) {
-      // Email routing errors shouldn't block warming setup
       console.warn(`⚠️  Email routing setup warning: ${error.message}`);
     }
 
@@ -763,7 +849,196 @@ class ResendWarmingScheduler {
       console.error('Error restoring warming jobs:', error);
     }
   }
+
+  // =============================================================================
+  // INBOUND EMAIL HANDLING
+  // =============================================================================
+
+  async processInboundEmail(inboundData) {
+    console.log('📥 Processing inbound email...');
+    
+    const { from, to, subject, text, html } = inboundData;
+    
+    // Extract email addresses
+    const fromEmail = this.extractEmail(from);
+    const toEmail = this.extractEmail(Array.isArray(to) ? to[0] : to);
+    
+    if (!fromEmail || !toEmail) {
+      console.warn('Invalid from/to addresses:', { from, to });
+      return { processed: false, reason: 'Invalid addresses' };
+    }
+
+    console.log(`📧 Inbound: ${fromEmail} → ${toEmail}`);
+    console.log(`📝 Subject: ${subject}`);
+
+    // Verify recipient is one of our warming addresses
+    const recipientCheck = await this.db.query(
+      'SELECT wa.*, d.user_id FROM warming_addresses wa JOIN domains d ON wa.domain_id = d.id WHERE wa.email_address = $1',
+      [toEmail.toLowerCase()]
+    );
+
+    if (recipientCheck.rows.length === 0) {
+      console.warn(`Recipient ${toEmail} not a warming address`);
+      return { processed: false, reason: 'Not a warming address' };
+    }
+
+    const recipientAddress = recipientCheck.rows[0];
+    const userId = recipientAddress.user_id;
+
+    // Verify sender is also one of our warming addresses (for security)
+    const senderCheck = await this.db.query(
+      'SELECT wa.*, d.user_id FROM warming_addresses wa JOIN domains d ON wa.domain_id = d.id WHERE wa.email_address = $1 AND d.user_id = $2',
+      [fromEmail.toLowerCase(), userId]
+    );
+
+    if (senderCheck.rows.length === 0) {
+      console.warn(`Sender ${fromEmail} not a valid warming address for this user`);
+      // Log as external email but don't auto-reply
+      await this.logInboundEmail(userId, fromEmail, toEmail, subject, false);
+      return { processed: true, replied: false, reason: 'External sender' };
+    }
+
+    // Log the inbound email
+    await this.logInboundEmail(userId, fromEmail, toEmail, subject, true);
+
+    // Check warming config for reply probability
+    const configResult = await this.db.query(
+      'SELECT * FROM warming_config WHERE user_id = $1',
+      [userId]
+    );
+
+    if (configResult.rows.length === 0 || configResult.rows[0].status !== 'active') {
+      console.log('Warming not active, skipping auto-reply');
+      return { processed: true, replied: false, reason: 'Warming not active' };
+    }
+
+    const config = configResult.rows[0];
+    const replyProbability = parseFloat(config.reply_probability) || 0.8;
+
+    // Decide whether to reply based on probability
+    if (Math.random() > replyProbability) {
+      console.log(`Skipping reply (probability: ${replyProbability})`);
+      return { processed: true, replied: false, reason: 'Random skip' };
+    }
+
+    // Generate and send reply
+    try {
+      // Delay reply by 1-5 minutes to seem natural
+      const delayMinutes = Math.floor(Math.random() * 4) + 1;
+      
+      setTimeout(async () => {
+        await this.sendAutoReply(userId, toEmail, fromEmail, subject, text || html, config);
+      }, delayMinutes * 60 * 1000);
+
+      console.log(`⏰ Auto-reply scheduled in ${delayMinutes} minutes`);
+      return { processed: true, replied: true, delay: delayMinutes };
+    } catch (error) {
+      console.error('Error scheduling reply:', error);
+      return { processed: true, replied: false, reason: error.message };
+    }
+  }
+
+  extractEmail(str) {
+    if (!str) return null;
+    // Handle formats like "Name <email@domain.com>" or just "email@domain.com"
+    const match = str.match(/<([^>]+)>/) || str.match(/([^\s<>]+@[^\s<>]+)/);
+    return match ? match[1].toLowerCase() : null;
+  }
+
+  async logInboundEmail(userId, from, to, subject, isWarming) {
+    try {
+      await this.db.query(`
+        INSERT INTO inbound_emails (user_id, from_email, to_email, subject, is_warming, created_at)
+        VALUES ($1, $2, $3, $4, $5, NOW())
+      `, [userId, from, to, subject, isWarming]);
+    } catch (error) {
+      // Table might not exist yet, log but don't fail
+      console.warn('Could not log inbound email:', error.message);
+    }
+  }
+
+  async sendAutoReply(userId, from, to, originalSubject, originalContent, config) {
+    console.log(`📤 Sending auto-reply: ${from} → ${to}`);
+
+    try {
+      // Get sender's display name
+      const addressResult = await this.db.query(
+        'SELECT display_name FROM warming_addresses WHERE email_address = $1',
+        [from.toLowerCase()]
+      );
+      const senderName = addressResult.rows[0]?.display_name || from.split('@')[0];
+
+      // Generate reply content
+      const context = {
+        senderName,
+        senderEmail: from,
+        topic: this.extractTopic(originalSubject),
+        aiFrequency: parseFloat(config.ai_frequency) || 0.3
+      };
+
+      const replyContent = await generateWarmingEmail('reply', context, {
+        subject: originalSubject,
+        body: originalContent
+      });
+
+      // Send via Resend
+      const result = await this.resend.sendEmail({
+        from: `${senderName} <${from}>`,
+        to: to,
+        subject: replyContent.subject,
+        text: replyContent.body,
+        html: `<div style="font-family: Arial, sans-serif; line-height: 1.6;">${replyContent.body.replace(/\n/g, '<br>')}</div>`
+      });
+
+      // Log the reply
+      await this.db.query(`
+        INSERT INTO warming_emails (user_id, sender_email, recipient_email, subject, is_reply, is_ai_generated, created_at)
+        VALUES ($1, $2, $3, $4, true, $5, NOW())
+      `, [userId, from, to, replyContent.subject, replyContent.isAI]);
+
+      // Update stats
+      await this.db.query(`
+        UPDATE warming_config SET 
+          replies_sent = COALESCE(replies_sent, 0) + 1,
+          emails_sent_total = COALESCE(emails_sent_total, 0) + 1,
+          ai_emails_sent = ai_emails_sent + $1,
+          last_email_at = NOW()
+        WHERE user_id = $2
+      `, [replyContent.isAI ? 1 : 0, userId]);
+
+      console.log(`✅ Auto-reply sent successfully (ID: ${result.id})`);
+      return result;
+    } catch (error) {
+      console.error('Auto-reply error:', error);
+      throw error;
+    }
+  }
+
+  extractTopic(subject) {
+    // Remove Re:, Fwd:, etc. and extract key topic
+    const cleaned = subject.replace(/^(Re:|Fwd:|Fw:)\s*/gi, '').trim();
+    return cleaned || 'our conversation';
+  }
 }
+
+// =============================================================================
+// INBOUND EMAIL TABLE MIGRATION
+// =============================================================================
+
+const INBOUND_TABLE_SQL = `
+  CREATE TABLE IF NOT EXISTS inbound_emails (
+    id UUID PRIMARY KEY DEFAULT uuid_generate_v4(),
+    user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+    from_email VARCHAR(255) NOT NULL,
+    to_email VARCHAR(255) NOT NULL,
+    subject VARCHAR(500),
+    is_warming BOOLEAN DEFAULT false,
+    processed_at TIMESTAMP WITH TIME ZONE,
+    created_at TIMESTAMP WITH TIME ZONE DEFAULT CURRENT_TIMESTAMP
+  );
+  CREATE INDEX IF NOT EXISTS idx_inbound_emails_user ON inbound_emails(user_id);
+  CREATE INDEX IF NOT EXISTS idx_inbound_emails_created ON inbound_emails(created_at);
+`;
 
 // =============================================================================
 // EXPORTS
@@ -773,6 +1048,9 @@ module.exports = {
   ResendClient,
   ResendWarmingScheduler,
   generateWarmingEmail,
+  verifyWebhookSignature,
+  verifySimpleSignature,
+  INBOUND_TABLE_SQL,
   CONVERSATION_STARTERS,
   REPLY_TEMPLATES,
   TOPICS,
