@@ -165,7 +165,7 @@ app.post('/api/domains/import', authenticateToken, async (req, res) => {
     
     // Step 1: Insert domain
     const result = await pool.query(
-      `INSERT INTO domains (user_id, domain_name, cloudflare_zone_id, verification_status, warming_enabled) 
+      `INSERT INTO domains (user_id, domain_name, zone_id, verification_status, warming_enabled) 
        VALUES ($1, $2, $3, 'pending', false) RETURNING *`,
       [req.user.userId, cleanDomain, zoneId]
     );
@@ -484,7 +484,7 @@ app.get('/api/warming/status', authenticateToken, async (req, res) => {
     
     // Get recent emails
     const recent = await pool.query(`
-      SELECT from_email, to_email, subject, status, is_ai_generated, created_at
+      SELECT sender_email, recipient_email, subject, status, is_ai_generated, created_at
       FROM warming_emails 
       WHERE user_id = $1 
       ORDER BY created_at DESC 
@@ -622,7 +622,7 @@ async function deployEmailWorker(zoneId, domainName, userId) {
   
   // Store webhook secret for this domain
   await pool.query(
-    'UPDATE domains SET webhook_secret = $1 WHERE cloudflare_zone_id = $2',
+    'UPDATE domains SET webhook_secret = $1 WHERE zone_id = $2',
     [webhookSecret, zoneId]
   );
   
@@ -694,12 +694,12 @@ app.post('/api/domains/:id/enable-inbox', authenticateToken, async (req, res) =>
     
     const d = domain.rows[0];
     
-    if (!d.cloudflare_zone_id) {
+    if (!d.zone_id) {
       return res.status(400).json({ error: 'Domain needs Cloudflare Zone ID' });
     }
     
     // Deploy Email Worker
-    const result = await deployEmailWorker(d.cloudflare_zone_id, d.domain_name, req.user.userId);
+    const result = await deployEmailWorker(d.zone_id, d.domain_name, req.user.userId);
     
     // Update domain
     await pool.query(
@@ -747,7 +747,7 @@ app.post('/api/webhook/email-receive', async (req, res) => {
     
     // Check if this is a warming email reply (match thread)
     const existingThread = await pool.query(
-      'SELECT thread_id FROM inbox_messages WHERE user_id = $1 AND (from_email = $2 OR to_email = $2) ORDER BY created_at DESC LIMIT 1',
+      'SELECT thread_id FROM inbox_messages WHERE user_id = $1 AND (sender_email = $2 OR recipient_email = $2) ORDER BY created_at DESC LIMIT 1',
       [d.owner_id, from]
     );
     
@@ -756,7 +756,7 @@ app.post('/api/webhook/email-receive', async (req, res) => {
     
     // Store in inbox
     await pool.query(`
-      INSERT INTO inbox_messages (user_id, message_type, from_email, to_email, subject, body, thread_id, is_warming, is_read)
+      INSERT INTO inbox_messages (user_id, message_type, sender_email, recipient_email, subject, body, thread_id, is_warming, is_read)
       VALUES ($1, 'received', $2, $3, $4, $5, $6, $7, false)
     `, [d.owner_id, from, to, subject, body, threadId, isWarming]);
     
@@ -995,13 +995,13 @@ async function sendWarmingEmail(fromEmail, toEmail, subject, body, userId, threa
     
     // Log to warming_emails
     await pool.query(`
-      INSERT INTO warming_emails (user_id, from_email, to_email, subject, body, message_id, resend_id, status, thread_id)
+      INSERT INTO warming_emails (user_id, sender_email, recipient_email, subject, body, message_id, resend_id, status, thread_id)
       VALUES ($1, $2, $3, $4, $5, $6, $7, 'sent', $8)
     `, [userId, fromEmail, toEmail, subject, body, messageId, result.data?.id, actualThreadId]);
     
     // Add to inbox
     const inboxResult = await pool.query(`
-      INSERT INTO inbox_messages (user_id, message_type, from_email, to_email, subject, body, resend_id, is_warming, thread_id, reply_to_id)
+      INSERT INTO inbox_messages (user_id, message_type, sender_email, recipient_email, subject, body, resend_id, is_warming, thread_id, reply_to_id)
       VALUES ($1, $2, $3, $4, $5, $6, $7, true, $8, $9)
       RETURNING id
     `, [userId, messageType, fromEmail, toEmail, subject, body, result.data?.id, actualThreadId, replyToId]);
