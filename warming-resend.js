@@ -720,6 +720,11 @@ class ResendWarmingScheduler {
       LIMIT 20
     `, [userId]);
 
+    // Get first email date for progress calculation
+    const firstEmailResult = await this.db.query(`
+      SELECT MIN(created_at) as started_at FROM warming_emails WHERE user_id = $1
+    `, [userId]);
+
     return {
       status: config.status,
       emailsPerDay: config.emails_per_day,
@@ -729,6 +734,7 @@ class ResendWarmingScheduler {
       aiEmailsSent: config.ai_emails_sent || 0,
       repliesSent: config.replies_sent || 0,
       lastEmailAt: config.last_email_at,
+      startedAt: firstEmailResult.rows[0]?.started_at || config.created_at,
       domains: domainsResult.rows,
       recentEmails: emailsResult.rows
     };
