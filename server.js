@@ -154,7 +154,7 @@ app.delete('/api/domains/:id', authenticateToken, async (req, res) => {
   }
 });
 
-// Enable warming on domain (adds to Resend)
+// Enable warming on domain (adds to Resend + auto-adds DNS to Cloudflare)
 app.post('/api/domains/:id/enable-warming', authenticateToken, async (req, res) => {
   try {
     const domain = await pool.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
@@ -162,7 +162,8 @@ app.post('/api/domains/:id/enable-warming', authenticateToken, async (req, res) 
       return res.status(404).json({ error: 'Domain not found' });
     }
     
-    const domainName = domain.rows[0].domain_name;
+    const d = domain.rows[0];
+    const domainName = d.domain_name;
     
     if (!resend) {
       return res.status(400).json({ error: 'Resend API not configured' });
@@ -171,18 +172,65 @@ app.post('/api/domains/:id/enable-warming', authenticateToken, async (req, res) 
     // Add domain to Resend
     const resendDomain = await resend.domains.create({ name: domainName });
     
+    if (!resendDomain.data?.id) {
+      return res.status(400).json({ error: 'Failed to add domain to Resend' });
+    }
+    
+    // Get the DNS records from Resend
+    const domainDetails = await resend.domains.get(resendDomain.data.id);
+    const records = domainDetails.data?.records || [];
+    
+    // Auto-add DNS records to Cloudflare if we have zone ID
+    let dnsResults = [];
+    if (d.cloudflare_zone_id && CF_API_TOKEN) {
+      for (const record of records) {
+        try {
+          const cfResponse = await fetch(
+            `${CF_API}/zones/${d.cloudflare_zone_id}/dns_records`,
+            {
+              method: 'POST',
+              headers: {
+                'Authorization': `Bearer ${CF_API_TOKEN}`,
+                'Content-Type': 'application/json'
+              },
+              body: JSON.stringify({
+                type: record.record_type || record.type,
+                name: record.name,
+                content: record.value,
+                ttl: 3600,
+                priority: record.priority || undefined
+              })
+            }
+          );
+          const cfResult = await cfResponse.json();
+          dnsResults.push({ 
+            name: record.name, 
+            success: cfResult.success,
+            error: cfResult.errors?.[0]?.message 
+          });
+        } catch (err) {
+          dnsResults.push({ name: record.name, success: false, error: err.message });
+        }
+      }
+      console.log(`📧 DNS records added for ${domainName}:`, dnsResults);
+    }
+    
     // Update domain record
     await pool.query(
       'UPDATE domains SET warming_enabled = true, resend_domain_id = $1 WHERE id = $2',
-      [resendDomain.data?.id, req.params.id]
+      [resendDomain.data.id, req.params.id]
     );
     
-    auditLog('WARMING_ENABLED', req.user.userId, req.ip, req.headers['user-agent'], { domainName });
+    auditLog('WARMING_ENABLED', req.user.userId, req.ip, req.headers['user-agent'], { domainName, dnsResults });
     
     res.json({ 
       success: true, 
-      resendDomain: resendDomain.data,
-      message: 'Domain added to Resend. Add DNS records in Resend dashboard to verify.'
+      resendDomainId: resendDomain.data.id,
+      dnsRecordsAdded: dnsResults.filter(r => r.success).length,
+      dnsResults,
+      message: d.cloudflare_zone_id 
+        ? `Domain added to Resend. ${dnsResults.filter(r => r.success).length}/${records.length} DNS records auto-added.`
+        : 'Domain added to Resend. Add DNS records manually (no Cloudflare Zone ID).'
     });
   } catch (error) {
     console.error('Enable warming error:', error);
@@ -211,6 +259,78 @@ app.post('/api/domains/:id/check-verification', authenticateToken, async (req, r
   } catch (error) {
     console.error('Check verification error:', error);
     res.status(500).json({ error: 'Failed to check verification' });
+  }
+});
+
+// Sync DNS records from Resend to Cloudflare
+app.post('/api/domains/:id/sync-dns', authenticateToken, async (req, res) => {
+  try {
+    const domain = await pool.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
+    if (domain.rows.length === 0) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+    
+    const d = domain.rows[0];
+    
+    if (!d.resend_domain_id) {
+      return res.status(400).json({ error: 'Enable warming first' });
+    }
+    
+    if (!d.cloudflare_zone_id) {
+      return res.status(400).json({ error: 'No Cloudflare Zone ID set' });
+    }
+    
+    if (!CF_API_TOKEN) {
+      return res.status(400).json({ error: 'Cloudflare API not configured' });
+    }
+    
+    // Get DNS records from Resend
+    const resendDomain = await resend.domains.get(d.resend_domain_id);
+    const records = resendDomain.data?.records || [];
+    
+    let dnsResults = [];
+    for (const record of records) {
+      try {
+        const cfResponse = await fetch(
+          `${CF_API}/zones/${d.cloudflare_zone_id}/dns_records`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${CF_API_TOKEN}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              type: record.record_type || record.type,
+              name: record.name,
+              content: record.value,
+              ttl: 3600,
+              priority: record.priority || undefined
+            })
+          }
+        );
+        const cfResult = await cfResponse.json();
+        dnsResults.push({ 
+          name: record.name,
+          type: record.record_type || record.type,
+          success: cfResult.success,
+          error: cfResult.errors?.[0]?.message 
+        });
+      } catch (err) {
+        dnsResults.push({ name: record.name, success: false, error: err.message });
+      }
+    }
+    
+    const successCount = dnsResults.filter(r => r.success).length;
+    const alreadyExist = dnsResults.filter(r => r.error?.includes('already exists')).length;
+    
+    res.json({ 
+      success: true,
+      message: `${successCount} records added, ${alreadyExist} already existed`,
+      dnsResults
+    });
+  } catch (error) {
+    console.error('Sync DNS error:', error);
+    res.status(500).json({ error: error.message || 'Failed to sync DNS' });
   }
 });
 
