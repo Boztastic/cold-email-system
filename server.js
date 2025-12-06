@@ -1039,6 +1039,83 @@ app.get('/api/domains/:id/warming-status', authenticateToken, verifyOwnership('d
   }
 });
 
+// Fix bounces - enable email routing for domain
+app.post('/api/domains/:id/fix-bounces', authenticateToken, verifyOwnership('domains'), async (req, res) => {
+  try {
+    const domain = await db.query('SELECT * FROM domains WHERE id = $1', [req.params.id]);
+    if (!domain.rows[0]) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+    
+    const domainData = domain.rows[0];
+    if (!domainData.zone_id) {
+      return res.status(400).json({ error: 'Domain not connected to Cloudflare' });
+    }
+
+    // Get Cloudflare config
+    const cfConfig = await db.query('SELECT * FROM cloudflare_configs WHERE user_id = $1', [req.user.id]);
+    if (!cfConfig.rows[0]) {
+      return res.status(400).json({ error: 'Cloudflare not connected' });
+    }
+
+    const decryptedToken = security.decrypt(cfConfig.rows[0].api_token);
+    
+    // Get user's email for forwarding
+    const userResult = await db.query('SELECT email FROM users WHERE id = $1', [req.user.id]);
+    const forwardTo = userResult.rows[0]?.email;
+    
+    if (!forwardTo) {
+      return res.status(400).json({ error: 'No email address found for forwarding' });
+    }
+
+    const zoneId = domainData.zone_id;
+    
+    // Enable email routing
+    const enableResponse = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/email/routing/enable`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${decryptedToken}`,
+        'Content-Type': 'application/json'
+      }
+    });
+    
+    // Create catch-all rule
+    const catchAllResponse = await fetch(`https://api.cloudflare.com/client/v4/zones/${zoneId}/email/routing/rules`, {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${decryptedToken}`,
+        'Content-Type': 'application/json'
+      },
+      body: JSON.stringify({
+        name: 'Catch-all for warming',
+        enabled: true,
+        matchers: [{ type: 'all' }],
+        actions: [{ type: 'forward', value: [forwardTo] }]
+      })
+    });
+
+    // Update database
+    await db.query(`
+      UPDATE domains SET 
+        email_routing_enabled = true,
+        forward_to = $1,
+        updated_at = NOW()
+      WHERE id = $2
+    `, [forwardTo, req.params.id]);
+
+    console.log(`✅ Email routing enabled for ${domainData.domain_name} → ${forwardTo}`);
+    
+    res.json({ 
+      success: true, 
+      message: `Email routing enabled. All emails will forward to ${forwardTo}`,
+      forwardTo 
+    });
+  } catch (error) {
+    console.error('Fix bounces error:', error);
+    res.status(500).json({ error: error.message });
+  }
+});
+
 // Get warming-enabled domains
 app.get('/api/warming/domains', authenticateToken, async (req, res) => {
   try {
