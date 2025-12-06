@@ -154,6 +154,31 @@ app.delete('/api/domains/:id', authenticateToken, async (req, res) => {
   }
 });
 
+// Update domain Zone ID
+app.put('/api/domains/:id/zone-id', authenticateToken, async (req, res) => {
+  try {
+    const { zoneId } = req.body;
+    
+    if (!zoneId) {
+      return res.status(400).json({ error: 'Zone ID required' });
+    }
+    
+    const result = await pool.query(
+      'UPDATE domains SET cloudflare_zone_id = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
+      [zoneId, req.params.id, req.user.userId]
+    );
+    
+    if (result.rows.length === 0) {
+      return res.status(404).json({ error: 'Domain not found' });
+    }
+    
+    res.json({ success: true, domain: result.rows[0] });
+  } catch (error) {
+    console.error('Update zone ID error:', error);
+    res.status(500).json({ error: 'Failed to update Zone ID' });
+  }
+});
+
 // Enable warming on domain (adds to Resend + auto-adds DNS to Cloudflare)
 app.post('/api/domains/:id/enable-warming', authenticateToken, async (req, res) => {
   try {
