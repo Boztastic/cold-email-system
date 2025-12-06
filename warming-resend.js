@@ -397,10 +397,39 @@ class ResendWarmingScheduler {
       }
     }
 
-    // Step 4: Trigger verification
+    // Step 4: Enable Email Routing (so warming emails don't bounce)
+    try {
+      // Get user's email for forwarding
+      const userResult = await this.db.query('SELECT email FROM users WHERE id = $1', [userId]);
+      const forwardTo = userResult.rows[0]?.email;
+      
+      if (forwardTo) {
+        // Enable email routing on the zone
+        await cloudflareClient.enableEmailRouting(zoneId);
+        console.log(`✅ Enabled email routing for ${domainName}`);
+        
+        // Create catch-all forwarding rule
+        await cloudflareClient.createCatchAllForwarding(zoneId, forwardTo);
+        console.log(`✅ Created catch-all forwarding to ${forwardTo}`);
+        
+        // Update domain record
+        await this.db.query(`
+          UPDATE domains SET 
+            email_routing_enabled = true,
+            forward_to = $1,
+            updated_at = NOW()
+          WHERE id = $2
+        `, [forwardTo, domainId]);
+      }
+    } catch (error) {
+      // Email routing errors shouldn't block warming setup
+      console.warn(`⚠️  Email routing setup warning: ${error.message}`);
+    }
+
+    // Step 5: Trigger verification
     await this.resend.verifyDomain(resendDomain.id);
 
-    // Step 5: Update database
+    // Step 6: Update database
     await this.db.query(`
       UPDATE domains SET 
         warming_enabled = true,
@@ -410,7 +439,7 @@ class ResendWarmingScheduler {
       WHERE id = $2
     `, [resendDomain.id, domainId]);
 
-    // Step 6: Create warming email addresses
+    // Step 7: Create warming email addresses
     const warmingAddresses = [
       `team@${domainName}`,
       `hello@${domainName}`,
