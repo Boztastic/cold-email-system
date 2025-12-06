@@ -98,9 +98,287 @@ app.post('/api/auth/login', async (req, res) => {
 });
 
 // ============================================
-// DOMAIN ROUTES
+// DOMAIN ROUTES - Auto-import from Cloudflare
 // ============================================
 
+// List domains from Cloudflare (available to import)
+app.get('/api/cloudflare/domains', authenticateToken, async (req, res) => {
+  try {
+    if (!CF_API_TOKEN) {
+      return res.status(400).json({ error: 'Cloudflare API not configured' });
+    }
+    
+    // Get all zones from Cloudflare
+    const zonesResponse = await fetch(`${CF_API}/zones?per_page=50`, {
+      headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` }
+    });
+    const zonesData = await zonesResponse.json();
+    
+    if (!zonesData.success) {
+      return res.status(400).json({ error: 'Failed to fetch from Cloudflare', details: zonesData.errors });
+    }
+    
+    // Get already imported domains for this user
+    const imported = await pool.query(
+      'SELECT domain_name FROM domains WHERE user_id = $1',
+      [req.user.userId]
+    );
+    const importedNames = imported.rows.map(d => d.domain_name);
+    
+    // Map and mark which are already imported
+    const domains = zonesData.result.map(zone => ({
+      id: zone.id,
+      name: zone.name,
+      status: zone.status,
+      imported: importedNames.includes(zone.name)
+    }));
+    
+    res.json({ domains });
+  } catch (error) {
+    console.error('Fetch Cloudflare domains error:', error);
+    res.status(500).json({ error: 'Failed to fetch domains' });
+  }
+});
+
+// Import domain from Cloudflare - one click full setup
+app.post('/api/domains/import', authenticateToken, async (req, res) => {
+  try {
+    const { zoneId, domainName } = req.body;
+    
+    if (!zoneId || !domainName) {
+      return res.status(400).json({ error: 'Zone ID and domain name required' });
+    }
+    
+    const cleanDomain = domainName.toLowerCase().trim();
+    let setupLog = [];
+    
+    // Check if already exists
+    const existing = await pool.query(
+      'SELECT id FROM domains WHERE user_id = $1 AND domain_name = $2',
+      [req.user.userId, cleanDomain]
+    );
+    if (existing.rows.length > 0) {
+      return res.status(400).json({ error: 'Domain already imported' });
+    }
+    
+    setupLog.push({ step: 'Cloudflare', status: 'success', message: `Zone ${zoneId.substring(0, 8)}...` });
+    
+    // Step 1: Insert domain
+    const result = await pool.query(
+      `INSERT INTO domains (user_id, domain_name, cloudflare_zone_id, verification_status, warming_enabled) 
+       VALUES ($1, $2, $3, 'pending', false) RETURNING *`,
+      [req.user.userId, cleanDomain, zoneId]
+    );
+    const domainId = result.rows[0].id;
+    
+    // Step 2: Create email accounts
+    const prefixes = ['team', 'hello', 'contact', 'info'];
+    for (const prefix of prefixes) {
+      await pool.query(
+        'INSERT INTO email_accounts (user_id, domain_id, email_address, display_name, account_type) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
+        [req.user.userId, domainId, `${prefix}@${cleanDomain}`, `${prefix.charAt(0).toUpperCase() + prefix.slice(1)} Team`, 'warming']
+      );
+    }
+    setupLog.push({ step: 'Email Accounts', status: 'success', message: '4 accounts created' });
+    
+    // Step 3: Add to Resend
+    let resendDomainId = null;
+    let resendRecords = [];
+    
+    if (resend) {
+      try {
+        const resendDomain = await resend.domains.create({ name: cleanDomain });
+        resendDomainId = resendDomain.data?.id;
+        
+        if (resendDomainId) {
+          const domainDetails = await resend.domains.get(resendDomainId);
+          resendRecords = domainDetails.data?.records || [];
+          
+          await pool.query(
+            'UPDATE domains SET resend_domain_id = $1, warming_enabled = true WHERE id = $2',
+            [resendDomainId, domainId]
+          );
+          setupLog.push({ step: 'Resend', status: 'success', message: 'Sending enabled' });
+        }
+      } catch (err) {
+        if (err.message?.includes('already exists')) {
+          // Try to get existing domain from Resend
+          try {
+            const existingDomains = await resend.domains.list();
+            const found = existingDomains.data?.data?.find(d => d.name === cleanDomain);
+            if (found) {
+              resendDomainId = found.id;
+              const domainDetails = await resend.domains.get(resendDomainId);
+              resendRecords = domainDetails.data?.records || [];
+              await pool.query(
+                'UPDATE domains SET resend_domain_id = $1, warming_enabled = true WHERE id = $2',
+                [resendDomainId, domainId]
+              );
+              setupLog.push({ step: 'Resend', status: 'success', message: 'Using existing domain' });
+            }
+          } catch (e) {
+            setupLog.push({ step: 'Resend', status: 'warning', message: 'Domain exists, configure manually' });
+          }
+        } else {
+          setupLog.push({ step: 'Resend', status: 'error', message: err.message });
+        }
+      }
+    } else {
+      setupLog.push({ step: 'Resend', status: 'error', message: 'API not configured' });
+    }
+    
+    // Step 4: Add DNS records to Cloudflare
+    let dnsAdded = 0;
+    let dnsExisted = 0;
+    
+    if (CF_API_TOKEN && resendRecords.length > 0) {
+      for (const record of resendRecords) {
+        try {
+          const cfResponse = await fetch(`${CF_API}/zones/${zoneId}/dns_records`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${CF_API_TOKEN}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              type: record.record_type || record.type,
+              name: record.name,
+              content: record.value,
+              ttl: 3600,
+              priority: record.priority || undefined
+            })
+          });
+          const cfResult = await cfResponse.json();
+          if (cfResult.success) {
+            dnsAdded++;
+          } else if (cfResult.errors?.[0]?.message?.includes('already exists')) {
+            dnsExisted++;
+          }
+        } catch (err) {
+          // Continue with other records
+        }
+      }
+      setupLog.push({ 
+        step: 'DNS Records', 
+        status: 'success', 
+        message: `${dnsAdded} added, ${dnsExisted} already existed` 
+      });
+    }
+    
+    // Step 5: Enable email routing
+    if (CF_API_TOKEN) {
+      try {
+        await fetch(`${CF_API}/zones/${zoneId}/email/routing/enable`, {
+          method: 'POST',
+          headers: { 'Authorization': `Bearer ${CF_API_TOKEN}` }
+        });
+        setupLog.push({ step: 'Email Routing', status: 'success', message: 'Enabled' });
+      } catch (err) {
+        setupLog.push({ step: 'Email Routing', status: 'warning', message: err.message });
+      }
+    }
+    
+    // Step 6: Check Resend verification (after DNS propagation)
+    if (resendDomainId) {
+      try {
+        // Wait a moment for DNS
+        await new Promise(r => setTimeout(r, 2000));
+        
+        const verifyResponse = await resend.domains.verify(resendDomainId);
+        const checkResponse = await resend.domains.get(resendDomainId);
+        const isVerified = checkResponse.data?.status === 'verified';
+        
+        await pool.query(
+          'UPDATE domains SET resend_verified = $1, verification_status = $2 WHERE id = $3',
+          [isVerified, isVerified ? 'verified' : 'pending', domainId]
+        );
+        
+        setupLog.push({ 
+          step: 'Verification', 
+          status: isVerified ? 'success' : 'pending', 
+          message: isVerified ? 'Domain verified!' : 'Pending - check back in a few minutes' 
+        });
+      } catch (err) {
+        setupLog.push({ step: 'Verification', status: 'pending', message: 'Will verify shortly' });
+      }
+    }
+    
+    // Step 7: Deploy Email Worker for inbox
+    let inboxEnabled = false;
+    if (CF_API_TOKEN && CF_ACCOUNT_ID) {
+      try {
+        const webhookSecret = crypto.randomBytes(32).toString('hex');
+        const workerName = `email-inbox-${cleanDomain.replace(/\./g, '-')}`;
+        const webhookUrl = `${WEBHOOK_BASE_URL}/api/webhook/email-receive`;
+        
+        // Deploy worker
+        const workerScript = generateEmailWorkerScript(webhookUrl, webhookSecret);
+        const workerResponse = await fetch(
+          `${CF_API}/accounts/${CF_ACCOUNT_ID}/workers/scripts/${workerName}`,
+          {
+            method: 'PUT',
+            headers: {
+              'Authorization': `Bearer ${CF_API_TOKEN}`,
+              'Content-Type': 'application/javascript'
+            },
+            body: workerScript
+          }
+        );
+        
+        if (workerResponse.ok) {
+          // Create catch-all rule to worker
+          await fetch(`${CF_API}/zones/${zoneId}/email/routing/rules`, {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${CF_API_TOKEN}`,
+              'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+              name: 'Inbox catch-all',
+              enabled: true,
+              matchers: [{ type: 'all' }],
+              actions: [{ type: 'worker', value: [workerName] }]
+            })
+          });
+          
+          await pool.query(
+            'UPDATE domains SET inbox_enabled = true, webhook_secret = $1 WHERE id = $2',
+            [webhookSecret, domainId]
+          );
+          inboxEnabled = true;
+          setupLog.push({ step: 'Inbox', status: 'success', message: 'Email worker deployed' });
+        } else {
+          setupLog.push({ step: 'Inbox', status: 'warning', message: 'Worker deployment failed' });
+        }
+      } catch (err) {
+        setupLog.push({ step: 'Inbox', status: 'warning', message: err.message });
+      }
+    } else {
+      setupLog.push({ step: 'Inbox', status: 'skipped', message: 'Configure CLOUDFLARE_ACCOUNT_ID' });
+    }
+    
+    auditLog('DOMAIN_IMPORTED', req.user.userId, req.ip, req.headers['user-agent'], { 
+      domainName: cleanDomain, 
+      setupLog 
+    });
+    
+    console.log(`✅ Domain imported: ${cleanDomain}`, setupLog);
+    
+    res.json({ 
+      success: true, 
+      domain: { ...result.rows[0], inbox_enabled: inboxEnabled },
+      setupLog 
+    });
+  } catch (error) {
+    if (error.code === '23505') {
+      return res.status(400).json({ error: 'Domain already exists' });
+    }
+    console.error('Import domain error:', error);
+    res.status(500).json({ error: error.message || 'Failed to import domain' });
+  }
+});
+
+// Get user's imported domains
 app.get('/api/domains', authenticateToken, async (req, res) => {
   try {
     const result = await pool.query(
@@ -114,36 +392,47 @@ app.get('/api/domains', authenticateToken, async (req, res) => {
   }
 });
 
-app.post('/api/domains', authenticateToken, async (req, res) => {
+// Refresh domain status
+app.post('/api/domains/:id/refresh', authenticateToken, async (req, res) => {
   try {
-    const { domainName, cloudflareZoneId } = req.body;
-    
-    const result = await pool.query(
-      'INSERT INTO domains (user_id, domain_name, cloudflare_zone_id, verification_status) VALUES ($1, $2, $3, $4) RETURNING *',
-      [req.user.userId, domainName, cloudflareZoneId, 'pending']
+    const domain = await pool.query(
+      'SELECT * FROM domains WHERE id = $1 AND user_id = $2',
+      [req.params.id, req.user.userId]
     );
     
-    // Create default email accounts for warming
-    const prefixes = ['team', 'hello', 'contact', 'info'];
-    for (const prefix of prefixes) {
-      await pool.query(
-        'INSERT INTO email_accounts (user_id, domain_id, email_address, display_name, account_type) VALUES ($1, $2, $3, $4, $5) ON CONFLICT DO NOTHING',
-        [req.user.userId, result.rows[0].id, `${prefix}@${domainName}`, `${prefix.charAt(0).toUpperCase() + prefix.slice(1)} Team`, 'warming']
-      );
+    if (domain.rows.length === 0) {
+      return res.status(404).json({ error: 'Domain not found' });
     }
     
-    auditLog('DOMAIN_ADDED', req.user.userId, req.ip, req.headers['user-agent'], { domainName });
+    const d = domain.rows[0];
+    let updates = {};
     
-    res.json(result.rows[0]);
+    // Check Resend verification
+    if (d.resend_domain_id && resend) {
+      try {
+        const resendDomain = await resend.domains.get(d.resend_domain_id);
+        updates.resend_verified = resendDomain.data?.status === 'verified';
+        updates.verification_status = updates.resend_verified ? 'verified' : 'pending';
+      } catch (err) {
+        console.error('Resend check error:', err);
+      }
+    }
+    
+    if (Object.keys(updates).length > 0) {
+      const setClauses = Object.keys(updates).map((k, i) => `${k} = $${i + 1}`).join(', ');
+      const values = [...Object.values(updates), req.params.id];
+      await pool.query(`UPDATE domains SET ${setClauses} WHERE id = $${values.length}`, values);
+    }
+    
+    const updated = await pool.query('SELECT * FROM domains WHERE id = $1', [req.params.id]);
+    res.json({ success: true, domain: updated.rows[0] });
   } catch (error) {
-    if (error.code === '23505') {
-      return res.status(400).json({ error: 'Domain already exists' });
-    }
-    console.error('Add domain error:', error);
-    res.status(500).json({ error: 'Failed to add domain' });
+    console.error('Refresh domain error:', error);
+    res.status(500).json({ error: 'Failed to refresh' });
   }
 });
 
+// Delete domain
 app.delete('/api/domains/:id', authenticateToken, async (req, res) => {
   try {
     await pool.query('DELETE FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
@@ -151,211 +440,6 @@ app.delete('/api/domains/:id', authenticateToken, async (req, res) => {
   } catch (error) {
     console.error('Delete domain error:', error);
     res.status(500).json({ error: 'Failed to delete domain' });
-  }
-});
-
-// Update domain Zone ID
-app.put('/api/domains/:id/zone-id', authenticateToken, async (req, res) => {
-  try {
-    const { zoneId } = req.body;
-    
-    if (!zoneId) {
-      return res.status(400).json({ error: 'Zone ID required' });
-    }
-    
-    const result = await pool.query(
-      'UPDATE domains SET cloudflare_zone_id = $1 WHERE id = $2 AND user_id = $3 RETURNING *',
-      [zoneId, req.params.id, req.user.userId]
-    );
-    
-    if (result.rows.length === 0) {
-      return res.status(404).json({ error: 'Domain not found' });
-    }
-    
-    res.json({ success: true, domain: result.rows[0] });
-  } catch (error) {
-    console.error('Update zone ID error:', error);
-    res.status(500).json({ error: 'Failed to update Zone ID' });
-  }
-});
-
-// Enable warming on domain (adds to Resend + auto-adds DNS to Cloudflare)
-app.post('/api/domains/:id/enable-warming', authenticateToken, async (req, res) => {
-  try {
-    const domain = await pool.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
-    if (domain.rows.length === 0) {
-      return res.status(404).json({ error: 'Domain not found' });
-    }
-    
-    const d = domain.rows[0];
-    const domainName = d.domain_name;
-    
-    if (!resend) {
-      return res.status(400).json({ error: 'Resend API not configured' });
-    }
-    
-    // Add domain to Resend
-    const resendDomain = await resend.domains.create({ name: domainName });
-    
-    if (!resendDomain.data?.id) {
-      return res.status(400).json({ error: 'Failed to add domain to Resend' });
-    }
-    
-    // Get the DNS records from Resend
-    const domainDetails = await resend.domains.get(resendDomain.data.id);
-    const records = domainDetails.data?.records || [];
-    
-    // Auto-add DNS records to Cloudflare if we have zone ID
-    let dnsResults = [];
-    if (d.cloudflare_zone_id && CF_API_TOKEN) {
-      for (const record of records) {
-        try {
-          const cfResponse = await fetch(
-            `${CF_API}/zones/${d.cloudflare_zone_id}/dns_records`,
-            {
-              method: 'POST',
-              headers: {
-                'Authorization': `Bearer ${CF_API_TOKEN}`,
-                'Content-Type': 'application/json'
-              },
-              body: JSON.stringify({
-                type: record.record_type || record.type,
-                name: record.name,
-                content: record.value,
-                ttl: 3600,
-                priority: record.priority || undefined
-              })
-            }
-          );
-          const cfResult = await cfResponse.json();
-          dnsResults.push({ 
-            name: record.name, 
-            success: cfResult.success,
-            error: cfResult.errors?.[0]?.message 
-          });
-        } catch (err) {
-          dnsResults.push({ name: record.name, success: false, error: err.message });
-        }
-      }
-      console.log(`📧 DNS records added for ${domainName}:`, dnsResults);
-    }
-    
-    // Update domain record
-    await pool.query(
-      'UPDATE domains SET warming_enabled = true, resend_domain_id = $1 WHERE id = $2',
-      [resendDomain.data.id, req.params.id]
-    );
-    
-    auditLog('WARMING_ENABLED', req.user.userId, req.ip, req.headers['user-agent'], { domainName, dnsResults });
-    
-    res.json({ 
-      success: true, 
-      resendDomainId: resendDomain.data.id,
-      dnsRecordsAdded: dnsResults.filter(r => r.success).length,
-      dnsResults,
-      message: d.cloudflare_zone_id 
-        ? `Domain added to Resend. ${dnsResults.filter(r => r.success).length}/${records.length} DNS records auto-added.`
-        : 'Domain added to Resend. Add DNS records manually (no Cloudflare Zone ID).'
-    });
-  } catch (error) {
-    console.error('Enable warming error:', error);
-    res.status(500).json({ error: error.message || 'Failed to enable warming' });
-  }
-});
-
-// Check Resend verification status
-app.post('/api/domains/:id/check-verification', authenticateToken, async (req, res) => {
-  try {
-    const domain = await pool.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
-    if (domain.rows.length === 0) {
-      return res.status(404).json({ error: 'Domain not found' });
-    }
-    
-    if (!domain.rows[0].resend_domain_id) {
-      return res.status(400).json({ error: 'Domain not registered with Resend yet' });
-    }
-    
-    const resendDomain = await resend.domains.get(domain.rows[0].resend_domain_id);
-    const isVerified = resendDomain.data?.status === 'verified';
-    
-    await pool.query('UPDATE domains SET resend_verified = $1 WHERE id = $2', [isVerified, req.params.id]);
-    
-    res.json({ verified: isVerified, status: resendDomain.data?.status });
-  } catch (error) {
-    console.error('Check verification error:', error);
-    res.status(500).json({ error: 'Failed to check verification' });
-  }
-});
-
-// Sync DNS records from Resend to Cloudflare
-app.post('/api/domains/:id/sync-dns', authenticateToken, async (req, res) => {
-  try {
-    const domain = await pool.query('SELECT * FROM domains WHERE id = $1 AND user_id = $2', [req.params.id, req.user.userId]);
-    if (domain.rows.length === 0) {
-      return res.status(404).json({ error: 'Domain not found' });
-    }
-    
-    const d = domain.rows[0];
-    
-    if (!d.resend_domain_id) {
-      return res.status(400).json({ error: 'Enable warming first' });
-    }
-    
-    if (!d.cloudflare_zone_id) {
-      return res.status(400).json({ error: 'No Cloudflare Zone ID set' });
-    }
-    
-    if (!CF_API_TOKEN) {
-      return res.status(400).json({ error: 'Cloudflare API not configured' });
-    }
-    
-    // Get DNS records from Resend
-    const resendDomain = await resend.domains.get(d.resend_domain_id);
-    const records = resendDomain.data?.records || [];
-    
-    let dnsResults = [];
-    for (const record of records) {
-      try {
-        const cfResponse = await fetch(
-          `${CF_API}/zones/${d.cloudflare_zone_id}/dns_records`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${CF_API_TOKEN}`,
-              'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-              type: record.record_type || record.type,
-              name: record.name,
-              content: record.value,
-              ttl: 3600,
-              priority: record.priority || undefined
-            })
-          }
-        );
-        const cfResult = await cfResponse.json();
-        dnsResults.push({ 
-          name: record.name,
-          type: record.record_type || record.type,
-          success: cfResult.success,
-          error: cfResult.errors?.[0]?.message 
-        });
-      } catch (err) {
-        dnsResults.push({ name: record.name, success: false, error: err.message });
-      }
-    }
-    
-    const successCount = dnsResults.filter(r => r.success).length;
-    const alreadyExist = dnsResults.filter(r => r.error?.includes('already exists')).length;
-    
-    res.json({ 
-      success: true,
-      message: `${successCount} records added, ${alreadyExist} already existed`,
-      dnsResults
-    });
-  } catch (error) {
-    console.error('Sync DNS error:', error);
-    res.status(500).json({ error: error.message || 'Failed to sync DNS' });
   }
 });
 
